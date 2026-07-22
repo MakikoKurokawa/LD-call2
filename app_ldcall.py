@@ -129,8 +129,8 @@ def load_and_process_all_data(spreadsheet_id):
                 
     return pd.DataFrame(all_records)
 
-# --- 集計テーブル作成ヘルパー関数 ---
-def create_summary_table(df, group_col):
+# --- 集計テーブル作成ヘルパー関数（単位＆小数第2位フォーマット対応） ---
+def create_summary_table(df, group_col, raw_mode=False):
     if df.empty:
         return pd.DataFrame()
     
@@ -145,12 +145,29 @@ def create_summary_table(df, group_col):
     summary["通電CVR(%)"] = (summary["CV数"] / summary["通電数"] * 100).fillna(0).round(2)
     summary["架電CVR(%)"] = (summary["CV数"] / summary["架電数"] * 100).round(2)
     
-    return summary
+    if raw_mode:
+        return summary
+
+    # 表示用に「件」や「.00%」を付与
+    formatted = summary.copy()
+    formatted["架電数"] = formatted["架電数"].apply(lambda x: f"{x:,}件")
+    formatted["通電数"] = formatted["通電数"].apply(lambda x: f"{x:,}件")
+    formatted["CV数"] = formatted["CV数"].apply(lambda x: f"{x:,}件")
+    formatted["獲得資料数"] = formatted["獲得資料数"].apply(lambda x: f"{x:,}件")
+    
+    formatted["通電率"] = formatted["通電率(%)"].apply(lambda x: f"{x:.2f}%")
+    formatted["通電CVR"] = formatted["通電CVR(%)"].apply(lambda x: f"{x:.2f}%")
+    formatted["架電CVR"] = formatted["架電CVR(%)"].apply(lambda x: f"{x:.2f}%")
+    
+    # 元の未加工数値列をドロップして並び替え
+    formatted = formatted.drop(columns=["通電率(%)", "通電CVR(%)", "架電CVR(%)"])
+    cols = [group_col, "架電数", "通電数", "通電率", "CV数", "通電CVR", "架電CVR", "獲得資料数"]
+    
+    return formatted[[c for c in cols if c in formatted.columns]]
 
 # --- 3. メイン処理 ---
 spreadsheet_id = st.secrets.get("SPREADSHEET_ID", "")
 
-# サイドバーは更新ボタンのみのシンプル構成
 st.sidebar.title("⚙️ 設定")
 if st.sidebar.button("🔄 データを最新に更新"):
     st.cache_data.clear()
@@ -181,14 +198,12 @@ if spreadsheet_id:
             with f_col2:
                 sel_lp = st.selectbox("📄 対象LPを選択", lp_list, index=0, key="t1_lp")
 
-            # フィルタリング
             df_t1 = df_all.copy()
             if sel_month != "全期間":
                 df_t1 = df_t1[df_t1["年月"] == sel_month]
             if sel_lp != "全LP合計":
                 df_t1 = df_t1[df_t1["LP"] == sel_lp]
 
-            # サマリー指標
             total_calls = len(df_t1)
             total_connects = df_t1["通電フラグ"].sum() if not df_t1.empty else 0
             total_cv = df_t1["CVフラグ"].sum() if not df_t1.empty else 0
@@ -200,11 +215,11 @@ if spreadsheet_id:
 
             st.markdown("---")
             c1, c2, c3, c4, c5 = st.columns(5)
-            c1.metric("総架電数", f"{total_calls:,} 件")
-            c2.metric("通電数 (通電率)", f"{total_connects:,} 件 ({tsuuden_rate:.1f}%)")
-            c3.metric("CV(許諾)数", f"{total_cv:,} 件")
-            c4.metric("通電CVR / 架電CVR", f"{tsuuden_cvr:.1f}% / {kaden_cvr:.1f}%")
-            c5.metric("獲得資料数", f"{total_docs:,} 件")
+            c1.metric("総架電数", f"{total_calls:,}件")
+            c2.metric("通電数 (通電率)", f"{total_connects:,}件 ({tsuuden_rate:.2f}%)")
+            c3.metric("CV(許諾)数", f"{total_cv:,}件")
+            c4.metric("通電CVR / 架電CVR", f"{tsuuden_cvr:.2f}% / {kaden_cvr:.2f}%")
+            c5.metric("獲得資料数", f"{total_docs:,}件")
 
             st.markdown("---")
             st.subheader("📅 日別・月別 パフォーマンス集計表")
@@ -221,17 +236,21 @@ if spreadsheet_id:
             with st.expander("🔒 【管理者専用】収益確認 ＆ 担当者別集計表"):
                 input_pass = st.text_input("管理者パスワードを入力してください", type="password", key="admin_pass")
                 if input_pass == ADMIN_PASSWORD:
-                    # 確定された稼働時間のみ集計
-                    confirmed_mins = st.session_state.get("confirmed_work_minutes", {})
-                    total_cost = sum(mins * MINUTE_WAGE for staff, mins in confirmed_mins.items() if staff.lower() != 'k')
+                    # 💡 稼働時間（分）と人件費の集計
+                    confirmed_mins_dict = st.session_state.get("confirmed_work_minutes", {})
+                    
+                    total_mins = sum(data.get("mins", 0) for staff, data in confirmed_mins_dict.items() if staff.lower() != 'k')
+                    total_hours = round(total_mins / 60, 2)
+                    total_cost = total_mins * MINUTE_WAGE
                     
                     total_revenue = total_docs * DOCUMENT_UNIT_PRICE
                     profit = total_revenue - total_cost
 
-                    m1, m2, m3 = st.columns(3)
+                    m1, m2, m3, m4 = st.columns(4)
                     m1.metric("確定売上 (資料数×4,500円)", f"¥{total_revenue:,}")
-                    m2.metric("人件費（提出分合計・kさん除外）", f"¥{int(total_cost):,}")
-                    m3.metric("推定粗利益", f"¥{int(profit):,}")
+                    m2.metric("総稼働時間 (kさん除外)", f"{total_mins:,}分 ({total_hours}時間)")
+                    m3.metric("概算人件費", f"¥{int(total_cost):,}")
+                    m4.metric("推定粗利益", f"¥{int(profit):,}")
 
                     st.markdown("---")
                     st.subheader("👥 担当者別 集計表")
@@ -259,18 +278,18 @@ if spreadsheet_id:
 
             st.subheader(f"🔄 【{sel_lp_t2}】 巡目別パフォーマンス（折れ線グラフ）")
             if not df_t2.empty:
-                df_junmu = create_summary_table(df_t2, "巡目")
-                st.dataframe(df_junmu, use_container_width=True)
+                df_junmu_raw = create_summary_table(df_t2, "巡目", raw_mode=True)
+                df_junmu_fmt = create_summary_table(df_t2, "巡目", raw_mode=False)
+                st.dataframe(df_junmu_fmt, use_container_width=True)
                 
-                # 積み上がらない「折れ線グラフ」に変更
-                chart_data = df_junmu.set_index("巡目")[["通電率(%)", "通電CVR(%)", "架電CVR(%)"]]
+                chart_data = df_junmu_raw.set_index("巡目")[["通電率(%)", "通電CVR(%)", "架電CVR(%)"]]
                 st.line_chart(chart_data)
 
             st.markdown("---")
             st.subheader(f"⏰ 【{sel_lp_t2}】 時間帯別パフォーマンス")
             if not df_t2.empty:
-                df_hour = create_summary_table(df_t2, "時間帯")
-                st.dataframe(df_hour, use_container_width=True)
+                df_hour_fmt = create_summary_table(df_t2, "時間帯", raw_mode=False)
+                st.dataframe(df_hour_fmt, use_container_width=True)
 
         # ==========================================
         # TAB 3: 個人レポート ＆ 稼働時間入力
@@ -294,30 +313,38 @@ if spreadsheet_id:
                     if "confirmed_work_minutes" not in st.session_state:
                         st.session_state["confirmed_work_minutes"] = {}
                     
-                    current_mins = st.session_state["confirmed_work_minutes"].get(selected_staff, 0)
+                    today_str = datetime.now().strftime('%Y-%m-%d')
+                    
+                    # 記録キー: (担当者名, 日付)
+                    staff_date_key = f"{selected_staff}_{today_str}"
+                    existing_data = st.session_state["confirmed_work_minutes"].get(staff_date_key, {})
+                    current_mins = existing_data.get("mins", 0)
                     
                     c_work1, c_work2 = st.columns([2, 1])
                     with c_work1:
-                        input_mins = st.number_input("稼働時間（分）を入力してください", min_value=0, max_value=600, value=current_mins, step=15)
+                        input_mins = st.number_input("本日の稼働時間（分）を入力してください", min_value=0, max_value=600, value=current_mins, step=15)
                     with c_work2:
-                        st.write("") # スペース調整
+                        st.write("")
                         st.write("")
                         if st.button("✅ 稼働時間を確定・提出する", key=f"btn_confirm_{selected_staff}"):
-                            st.session_state["confirmed_work_minutes"][selected_staff] = input_mins
-                            st.success(f"{selected_staff} さんの稼働時間（{input_mins}分）を提出しました！")
+                            st.session_state["confirmed_work_minutes"][staff_date_key] = {
+                                "staff": selected_staff,
+                                "date": today_str,
+                                "mins": input_mins
+                            }
+                            st.success(f"{selected_staff} さんの本日({today_str})の稼働時間（{input_mins}分）を提出しました！")
 
                     # --- B. 当日（本日）の全LP合計 成績表示 ---
-                    today_str = datetime.now().strftime('%Y-%m-%d')
-                    df_person_all = df_all[(df_all["担当者"] == selected_staff) & (df_all["日付"] == today_str)]
+                    df_person_today = df_all[(df_all["担当者"] == selected_staff) & (df_all["日付"] == today_str)]
                     
-                    today_cv = df_person_all["CVフラグ"].sum() if not df_person_all.empty else 0
-                    today_docs = df_person_all["資料数"].sum() if not df_person_all.empty else 0
+                    today_cv = df_person_today["CVフラグ"].sum() if not df_person_today.empty else 0
+                    today_docs = df_person_today["資料数"].sum() if not df_person_today.empty else 0
 
                     st.markdown("---")
                     st.markdown(f"### 📌 本日 ({today_str}) の全LP合計成果")
                     p1, p2 = st.columns(2)
-                    p1.metric("本日 CV(許諾)数", f"{today_cv} 件")
-                    p2.metric("本日 獲得資料請求数", f"{today_docs} 件")
+                    p1.metric("本日 CV(許諾)数", f"{today_cv}件")
+                    p2.metric("本日 獲得資料請求数", f"{today_docs}件")
 
                     # --- C. 日報用テンプレート ---
                     st.markdown("---")
@@ -329,27 +356,43 @@ if spreadsheet_id:
                     st.code(slack_text, language="markdown")
                     st.caption("💡 右上のアイコンでテキストをコピーし、自分のSlackにペーストして投稿してください。")
 
-                    # --- D. 個人用：LP別×巡目別分析 ---
+                    # --- D. 個人用：日別パフォーマンス表（提出済み稼働時間付き） ---
+                    st.markdown("---")
+                    st.subheader(f"📅 {selected_staff} さんの日別パフォーマンス表")
+                    
+                    p_sel_month = st.selectbox("📅 対象月を選択", available_months + ["全期間"], index=0, key="p_month")
+                    
+                    df_person = df_all[df_all["担当者"] == selected_staff]
+                    if p_sel_month != "全期間":
+                        df_person = df_person[df_person["年月"] == p_sel_month]
+
+                    if not df_person.empty:
+                        # 日別集計テーブル作成
+                        df_p_daily = create_summary_table(df_person, "日付")
+                        
+                        # 💡 稼働時間（分）を日付の左側にマージ
+                        mins_list = []
+                        for _, row in df_p_daily.iterrows():
+                            d_str = row["日付"]
+                            key = f"{selected_staff}_{d_str}"
+                            data = st.session_state["confirmed_work_minutes"].get(key, {})
+                            m_val = data.get("mins", "-")
+                            mins_list.append(f"{m_val}分" if m_val != "-" else "-")
+                        
+                        df_p_daily.insert(0, "稼働時間", mins_list)
+                        st.dataframe(df_p_daily, use_container_width=True)
+
                     st.markdown("---")
                     st.subheader(f"📊 {selected_staff} さんのLP別・巡目別集計")
-                    
-                    p_f1, p_f2 = st.columns(2)
-                    with p_f1:
-                        p_sel_month = st.selectbox("📅 対象月を選択", available_months + ["全期間"], index=0, key="p_month")
-                    with p_f2:
-                        p_sel_lp = st.selectbox("📄 対象LPを選択", lp_list, index=0, key="p_lp")
+                    p_sel_lp = st.selectbox("📄 対象LPを選択", lp_list, index=0, key="p_lp")
 
-                    df_person_ft = df_all[df_all["担当者"] == selected_staff]
-                    if p_sel_month != "全期間":
-                        df_person_ft = df_person_ft[df_person_ft["年月"] == p_sel_month]
-                    if p_sel_lp != "全LP合計":
-                        df_person_ft = df_person_ft[df_person_ft["LP"] == p_sel_lp]
+                    df_person_lp = df_person if p_sel_lp == "全LP合計" else df_person[df_person["LP"] == p_sel_lp]
 
-                    if not df_person_ft.empty:
-                        df_p_junmu = create_summary_table(df_person_ft, "巡目")
+                    if not df_person_lp.empty:
+                        df_p_junmu = create_summary_table(df_person_lp, "巡目")
                         st.dataframe(df_p_junmu, use_container_width=True)
                     else:
-                        st.info("該当する期間・LPのデータはありません。")
+                        st.info("該当するデータの組み合わせはありません。")
 
                 elif input_user_pass != "":
                     st.error("パスワードが正しくありません。")
