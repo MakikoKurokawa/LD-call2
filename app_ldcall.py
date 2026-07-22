@@ -12,15 +12,15 @@ HOURLY_WAGE = 2000              # 時給2,000円
 MINUTE_WAGE = HOURLY_WAGE / 60  # 分単価（約33.33円）
 DOCUMENT_UNIT_PRICE = 4500      # 資料1件あたりの売上単価 (4,500円)
 
-# secretsからパスワード辞書を取得（設定がない場合はデフォルト値）
 USER_PASSWORDS = st.secrets.get("passwords", {"admin": "admin123"})
 ADMIN_PASSWORD = USER_PASSWORDS.get("admin", "admin123")
 
 st.title("📞 コール分析＆集計ダッシュボード")
 
-# --- 2. Googleスプレッドシート自動取得関数 ---
-@st.cache_data(ttl=600)
-def load_data_from_gsheets(spreadsheet_id):
+# --- 2. スプレッドシート読み込み＆前処理の統合キャッシュ化 ---
+@st.cache_data(ttl=600, show_spinner="スプレッドシートから高速データ取得中...")
+def load_and_process_all_data(spreadsheet_id):
+    """Googleスプレッドシートを取得し、前処理まで完了した状態でキャッシュする"""
     scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
     creds_dict = dict(st.secrets["gcp_service_account"])
     creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
@@ -29,99 +29,102 @@ def load_data_from_gsheets(spreadsheet_id):
     sh = client.open_by_key(spreadsheet_id)
     worksheets = sh.worksheets()
     
-    sheets_data = {}
-    for ws in worksheets:
-        raw_values = ws.get_all_values()
-        if raw_values:
-            sheets_data[ws.title] = pd.DataFrame(raw_values)
-            
-    return sheets_data
-
-# --- 3. データ前処理ロジック ---
-def process_call_data(df_raw, lp_name="全体"):
-    records = []
+    all_records = []
     
-    for idx, row in df_raw.iterrows():
-        if idx == 0:  # ヘッダー行をスキップ
+    # 巡目と列インデックス（0開始）
+    # 1巡目: C(2)=日付, D(3)=結果, E(4)=担当, H(7)=備考
+    # 2巡目: I(8)=日付, J(9)=結果, K(10)=担当, N(13)=備考
+    # 3巡目: O(14)=日付, P(15)=結果, Q(16)=担当, T(19)=備考
+    # 4巡目: U(20)=日付, V(21)=結果, W(22)=担当, Z(25)=備考
+    call_pairs = [
+        (2, 3, 4, 7),
+        (8, 9, 10, 13),
+        (14, 15, 16, 19),
+        (20, 21, 22, 25)
+    ]
+    
+    circle_num_map = {'⑨': 9, '⑩': 10, '⑪': 11, '⑫': 12, '⑬': 13, '⑭': 14, '⑮': 15, '⑯': 16, '⑰': 17, '⑱': 18}
+
+    for ws in worksheets:
+        lp_name = ws.title
+        raw_values = ws.get_all_values()
+        if len(raw_values) <= 1:
             continue
             
-        current_lp = str(row.iloc[0]).strip() if len(row) > 0 and pd.notnull(row.iloc[0]) and str(row.iloc[0]).strip() != "" else lp_name
-        
-        call_pairs = [
-            (2, 3, 4, 7),     # 1巡目: C, D, E, H
-            (8, 9, 10, 13),   # 2巡目: I, J, K, N
-            (14, 15, 16, 19), # 3巡目: O, P, Q, T
-            (20, 21, 22, 25)  # 4巡目: U, V, W, Z
-        ]
-        
-        for idx_call, (col_date, col_res, col_staff, col_note) in enumerate(call_pairs, 1):
-            if len(row) <= col_note:
-                continue
-            
-            date_val = str(row.iloc[col_date]).strip() if pd.notnull(row.iloc[col_date]) else ""
-            res_val = str(row.iloc[col_res]).strip() if pd.notnull(row.iloc[col_res]) else ""
-            staff_val = str(row.iloc[col_staff]).strip() if pd.notnull(row.iloc[col_staff]) else ""
-            note_val = str(row.iloc[col_note]).strip() if pd.notnull(row.iloc[col_note]) else ""
-            
-            if not res_val or res_val == "結果":
+        # 1行目以降（ヘッダー除外）を処理
+        for row in raw_values[1:]:
+            if not row or not any(row):
                 continue
                 
-            # --- A. 担当者名の抽出 (小文字'r'を除外) ---
-            match_name = re.match(r'^([^\d①-⑳]+)', staff_val)
-            if match_name:
-                raw_name = match_name.group(1)
-                staff_name = raw_name.replace('r', '').strip()
-            else:
-                staff_name = "不明" if not staff_val else staff_val
+            current_lp = str(row[0]).strip() if pd.notnull(row[0]) and str(row[0]).strip() != "" else lp_name
             
-            # --- B. 時間帯の抽出 (1つ目の数字を適用) ---
-            hours = []
-            circle_num_map = {'⑨': 9, '⑩': 10, '⑪': 11, '⑫': 12, '⑬': 13, '⑭': 14, '⑮': 15, '⑯': 16, '⑰': 17, '⑱': 18}
-            for char in staff_val:
-                if char in circle_num_map:
-                    hours.append(circle_num_map[char])
-            if not hours:
-                digits = re.findall(r'\d+', staff_val)
-                hours = [int(d) for d in digits if 8 <= int(d) <= 20]
-            
-            primary_hour = hours[0] if hours else None
-            
-            # --- C. 資料数の抽出 ---
-            doc_count = 0
-            if note_val.isdigit():
-                doc_count = int(note_val)
-            else:
-                doc_digits = re.findall(r'\d+', note_val)
-                if doc_digits:
-                    doc_count = int(doc_digits[0])
-            
-            # --- D. フラグ判定 ---
-            is_cv = 1 if "許諾" in res_val else 0
-            is_connected = 0 if any(ng in res_val for ng in ["繋がらない", "NG", "不通", "留守", "着拒"]) else 1
-            
-            # --- E. 月情報の整理 ---
-            month_str = "不明"
-            if date_val:
-                parsed_date = pd.to_datetime(date_val, errors='coerce')
-                if pd.notnull(parsed_date):
-                    month_str = parsed_date.strftime('%Y-%m')
-            
-            records.append({
-                "年月": month_str,
-                "日付": date_val,
-                "LP": current_lp,
-                "巡目": f"{idx_call}巡目",
-                "結果": res_val,
-                "担当者": staff_name,
-                "時間帯": f"{primary_hour}時台" if primary_hour else "不明",
-                "通電フラグ": is_connected,
-                "CVフラグ": is_cv,
-                "資料数": doc_count
-            })
-            
-    return pd.DataFrame(records)
+            for idx_call, (col_date, col_res, col_staff, col_note) in enumerate(call_pairs, 1):
+                if len(row) <= col_note:
+                    continue
+                
+                res_val = str(row[col_res]).strip() if row[col_res] else ""
+                if not res_val or res_val == "結果":
+                    continue
+                    
+                date_val = str(row[col_date]).strip() if row[col_date] else ""
+                staff_val = str(row[col_staff]).strip() if row[col_staff] else ""
+                note_val = str(row[col_note]).strip() if row[col_note] else ""
+                
+                # A. 担当者名 (r除外)
+                match_name = re.match(r'^([^\d①-⑳]+)', staff_val)
+                if match_name:
+                    staff_name = match_name.group(1).replace('r', '').strip()
+                else:
+                    staff_name = "不明" if not staff_val else staff_val
+                
+                # B. 時間帯 (1つ目の数字)
+                primary_hour = None
+                for char in staff_val:
+                    if char in circle_num_map:
+                        primary_hour = circle_num_map[char]
+                        break
+                if primary_hour is None:
+                    digits = re.findall(r'\d+', staff_val)
+                    valid_digits = [int(d) for d in digits if 8 <= int(d) <= 20]
+                    if valid_digits:
+                        primary_hour = valid_digits[0]
+                
+                # C. 資料数
+                doc_count = 0
+                if note_val.isdigit():
+                    doc_count = int(note_val)
+                else:
+                    doc_digits = re.findall(r'\d+', note_val)
+                    if doc_digits:
+                        doc_count = int(doc_digits[0])
+                
+                # D. フラグ
+                is_cv = 1 if "許諾" in res_val else 0
+                is_connected = 0 if any(ng in res_val for ng in ["繋がらない", "NG", "不通", "留守", "着拒"]) else 1
+                
+                # E. 月情報
+                month_str = "不明"
+                if date_val:
+                    parsed_date = pd.to_datetime(date_val, errors='coerce')
+                    if pd.notnull(parsed_date):
+                        month_str = parsed_date.strftime('%Y-%m')
+                
+                all_records.append({
+                    "年月": month_str,
+                    "日付": date_val,
+                    "LP": current_lp,
+                    "巡目": f"{idx_call}巡目",
+                    "結果": res_val,
+                    "担当者": staff_name,
+                    "時間帯": f"{primary_hour}時台" if primary_hour else "不明",
+                    "通電フラグ": is_connected,
+                    "CVフラグ": is_cv,
+                    "資料数": doc_count
+                })
+                
+    return pd.DataFrame(all_records)
 
-# --- 4. メイン処理 ---
+# --- 3. メイン処理 ---
 spreadsheet_id = st.secrets.get("SPREADSHEET_ID", "")
 
 if st.sidebar.button("🔄 データを最新に更新"):
@@ -130,32 +133,33 @@ if st.sidebar.button("🔄 データを最新に更新"):
 
 if spreadsheet_id:
     try:
-        sheets_dict = load_data_from_gsheets(spreadsheet_id)
-        sheet_names = list(sheets_dict.keys())
-        
-        # LP選択
-        selected_lp = st.sidebar.selectbox("対象LP（タブ）を選択", ["全LP合計"] + sheet_names)
-        
-        if selected_lp == "全LP合計":
-            df_list = [process_call_data(sheets_dict[s], lp_name=s) for s in sheet_names]
-            df_processed = pd.concat(df_list, ignore_index=True) if df_list else pd.DataFrame()
-        else:
-            df_processed = process_call_data(sheets_dict[selected_lp], lp_name=selected_lp)
+        # データ取得 ＆ 前処理を一括キャッシュ処理
+        df_all = load_and_process_all_data(spreadsheet_id)
 
-        if not df_processed.empty:
-            available_months = sorted([m for m in df_processed["年月"].unique() if m != "不明"], reverse=True)
+        if not df_all.empty:
+            # LP選択フィルター
+            lp_list = ["全LP合計"] + sorted(list(df_all["LP"].unique()))
+            selected_lp = st.sidebar.selectbox("対象LP（タブ）を選択", lp_list)
+            
+            if selected_lp != "全LP合計":
+                df_lp = df_all[df_all["LP"] == selected_lp]
+            else:
+                df_lp = df_all
+
+            # 月選択フィルター
+            available_months = sorted([m for m in df_lp["年月"].unique() if m != "不明"], reverse=True)
             selected_month = st.sidebar.selectbox("対象月を選択", ["全期間"] + available_months)
             
             if selected_month != "全期間":
-                df_filtered = df_processed[df_processed["年月"] == selected_month]
+                df_filtered = df_lp[df_lp["年月"] == selected_month]
             else:
-                df_filtered = df_processed
+                df_filtered = df_lp
         else:
             df_filtered = pd.DataFrame()
 
-        all_staffs = [s for s in df_filtered["担当者"].unique() if s != "不明"] if not df_filtered.empty else []
+        all_staffs = sorted([s for s in df_filtered["担当者"].unique() if s != "不明"]) if not df_filtered.empty else []
 
-        # --- 5. 画面構成 ---
+        # --- 4. 画面表示 ---
         tab1, tab2, tab3 = st.tabs(["📊 全体パフォーマンス", "⏰ 時間帯別分析", "👤 個人レポート＆稼働時間"])
 
         # TAB 1: 全体集計
@@ -182,7 +186,7 @@ if spreadsheet_id:
             c3.metric("CV(許諾)数", f"{total_cv:,} 件")
             c4.metric("獲得資料数", f"{total_docs:,} 件")
 
-            # 💡 管理者用 収益閲覧エリア
+            # 💡 管理者専用 収益エリア
             st.markdown("---")
             with st.expander("🔒 【管理者専用】売上・人件費・利益の確認"):
                 input_pass = st.text_input("管理者パスワードを入力してください", type="password", key="admin_pass")
@@ -215,7 +219,7 @@ if spreadsheet_id:
                 st.bar_chart(hour_summary.set_index("時間帯")[["通電率(%)", "CV率(%)"]])
                 st.dataframe(hour_summary, use_container_width=True)
 
-        # TAB 3: 個人レポート（🔒 パスワード保護）
+        # TAB 3: 個人レポート
         with tab3:
             st.subheader("👤 個人成績 ＆ 日報出力")
             selected_staff = st.selectbox("担当者を選択してください", all_staffs)
@@ -224,7 +228,6 @@ if spreadsheet_id:
                 st.info(f"🔒 **{selected_staff}** さんの詳細データを表示するにはパスワードが必要です。")
                 input_user_pass = st.text_input(f"{selected_staff} さんのパスワードを入力", type="password", key=f"pass_{selected_staff}")
                 
-                # その人専用のパスワード、または管理者パスワードでロック解除
                 correct_pass = USER_PASSWORDS.get(selected_staff, "")
                 
                 if input_user_pass != "" and (input_user_pass == correct_pass or input_user_pass == ADMIN_PASSWORD):
