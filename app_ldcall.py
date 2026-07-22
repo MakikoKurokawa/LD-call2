@@ -16,7 +16,7 @@ DOCUMENT_UNIT_PRICE = 4500      # 資料1件あたりの売上単価 (4,500円)
 USER_PASSWORDS = st.secrets.get("passwords", {"admin": "admin123"})
 ADMIN_PASSWORD = USER_PASSWORDS.get("admin", "admin123")
 
-# 💡 パスワード設定されているメンバー一覧（adminは除く）
+# パスワード設定されているメンバー一覧（adminは除く）
 REGISTERED_MEMBERS = [k for k in USER_PASSWORDS.keys() if k.lower() != "admin"]
 
 st.title("📞 コール分析＆収益管理ダッシュボード")
@@ -41,14 +41,21 @@ def parse_custom_date(date_str):
             return None, "不明"
     return None, "不明"
 
-# --- 2. スプレッドシート読み込み＆前処理 ---
-@st.cache_data(ttl=600, show_spinner="スプレッドシートから高速データ取得中...")
-def load_and_process_all_data(spreadsheet_id):
-    scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+# --- GSpread認証クライアント取得関数 ---
+def get_gspread_client():
+    # 書き込みも行うため drive / spreadsheets スコープを指定
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
     creds_dict = dict(st.secrets["gcp_service_account"])
     creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-    client = gspread.authorize(creds)
-    
+    return gspread.authorize(creds)
+
+# --- 2. スプレッドシート読み込み＆前処理 ---
+@st.cache_data(ttl=300, show_spinner="スプレッドシートから高速データ取得中...")
+def load_and_process_all_data(spreadsheet_id):
+    client = get_gspread_client()
     sh = client.open_by_key(spreadsheet_id)
     worksheets = sh.worksheets()
     
@@ -59,6 +66,9 @@ def load_and_process_all_data(spreadsheet_id):
 
     for ws in worksheets:
         lp_name = ws.title
+        if lp_name == "稼働時間":  # 稼働時間シートはコールデータの読み込み対象外
+            continue
+            
         raw_values = ws.get_all_values()
         if len(raw_values) <= 1:
             continue
@@ -132,6 +142,47 @@ def load_and_process_all_data(spreadsheet_id):
                 
     return pd.DataFrame(all_records)
 
+# --- 3. 稼働時間シートの読み込み・書き込み関数 ---
+@st.cache_data(ttl=60, show_spinner="稼働時間データを読み込み中...")
+def load_work_hours(spreadsheet_id):
+    try:
+        client = get_gspread_client()
+        sh = client.open_by_key(spreadsheet_id)
+        ws = sh.worksheet("稼働時間")
+        records = ws.get_all_records()
+        df_wh = pd.DataFrame(records)
+        if not df_wh.empty and "日付" in df_wh.columns and "担当者" in df_wh.columns and "稼働時間" in df_wh.columns:
+            df_wh["日付"] = df_wh["日付"].astype(str)
+            df_wh["担当者"] = df_wh["担当者"].astype(str)
+            df_wh["稼働時間"] = pd.to_numeric(df_wh["稼働時間"], errors='coerce').fillna(0).astype(int)
+            return df_wh
+    except Exception as e:
+        pass
+    return pd.DataFrame(columns=["日付", "担当者", "稼働時間"])
+
+def save_work_hour(spreadsheet_id, date_str, staff_name, mins):
+    client = get_gspread_client()
+    sh = client.open_by_key(spreadsheet_id)
+    ws = sh.worksheet("稼働時間")
+    
+    records = ws.get_all_values()
+    if not records:
+        ws.append_row(["日付", "担当者", "稼働時間"])
+        records = [["日付", "担当者", "稼働時間"]]
+        
+    row_to_update = None
+    for idx, row in enumerate(records[1:], start=2):
+        if len(row) >= 2 and row[0] == date_str and row[1] == staff_name:
+            row_to_update = idx
+            break
+            
+    if row_to_update:
+        ws.update_cell(row_to_update, 3, mins)
+    else:
+        ws.append_row([date_str, staff_name, mins])
+        
+    st.cache_data.clear()
+
 # --- 集計テーブル作成ヘルパー関数 ---
 def create_summary_table(df, group_col, raw_mode=False):
     if df.empty:
@@ -166,7 +217,7 @@ def create_summary_table(df, group_col, raw_mode=False):
     
     return formatted[[c for c in cols if c in formatted.columns]]
 
-# --- 3. メイン処理 ---
+# --- 4. メイン処理 ---
 spreadsheet_id = st.secrets.get("SPREADSHEET_ID", "")
 
 st.sidebar.title("⚙️ 設定")
@@ -177,18 +228,17 @@ if st.sidebar.button("🔄 データを最新に更新"):
 if spreadsheet_id:
     try:
         df_all = load_and_process_all_data(spreadsheet_id)
+        df_work_hours = load_work_hours(spreadsheet_id)
 
         if not df_all.empty:
             available_months = sorted([m for m in df_all["年月"].unique() if m != "不明"], reverse=True)
             lp_list = ["全LP合計"] + sorted([str(x) for x in df_all["LP"].unique()])
             
-            # 💡【担当者絞り込みロジック】
-            # 直近2ヶ月（最新月とその前の月）を取得
+            # 【担当者絞り込みロジック】
             recent_2_months = available_months[:2] if len(available_months) >= 2 else available_months
             df_recent = df_all[df_all["年月"].isin(recent_2_months)]
             recent_active_staffs = df_recent["担当者"].unique()
             
-            # 「secrets.tomlに登録がある人」かつ「直近2ヶ月で1件以上架電実績がある人」のみに限定
             if REGISTERED_MEMBERS:
                 all_staffs = sorted([s for s in REGISTERED_MEMBERS if s in recent_active_staffs])
             else:
@@ -196,7 +246,7 @@ if spreadsheet_id:
         else:
             available_months, lp_list, all_staffs = [], ["全LP合計"], []
 
-        # --- 4. 画面表示 ---
+        # --- 5. 画面表示 ---
         tab1, tab2, tab3 = st.tabs(["📊 全体パフォーマンス", "📈 巡目・時間帯別分析", "👤 個人レポート＆日報"])
 
         # ==========================================
@@ -248,9 +298,13 @@ if spreadsheet_id:
             with st.expander("🔒 【管理者専用】収益確認 ＆ 担当者別集計表"):
                 input_pass = st.text_input("管理者パスワードを入力してください", type="password", key="admin_pass")
                 if input_pass == ADMIN_PASSWORD:
-                    confirmed_mins_dict = st.session_state.get("confirmed_work_minutes", {})
-                    
-                    total_mins = sum(data.get("mins", 0) for staff, data in confirmed_mins_dict.items() if staff.lower() != 'k')
+                    # スプレッドシートから読み込んだ稼働時間で集計（kさん除外）
+                    if not df_work_hours.empty:
+                        df_wh_filtered = df_work_hours[df_work_hours["担当者"].str.lower() != 'k']
+                        total_mins = int(df_wh_filtered["稼働時間"].sum())
+                    else:
+                        total_mins = 0
+                        
                     total_hours = round(total_mins / 60, 2)
                     total_cost = total_mins * MINUTE_WAGE
                     
@@ -312,7 +366,7 @@ if spreadsheet_id:
                 selected_staff = st.selectbox("担当者を選択してください", all_staffs)
             else:
                 selected_staff = None
-                st.warning("対象となるアクティブな担当者が見つかりません。secrets.tomlの設定をご確認ください。")
+                st.warning("対象となるアクティブな担当者が見つかりません。")
 
             if selected_staff:
                 st.info(f"🔒 **{selected_staff}** さんのパスワードを入力してください。")
@@ -323,17 +377,18 @@ if spreadsheet_id:
                 if input_user_pass != "" and (input_user_pass == correct_pass or input_user_pass == ADMIN_PASSWORD):
                     st.success("認証されました！")
                     
-                    # --- A. 稼働時間入力 ＆ 確定登録 ---
+                    # --- A. 稼働時間入力 ＆ 確定登録 (スプレッドシート永続化) ---
                     st.markdown("---")
                     st.markdown("#### ✍️ 本日の稼働時間 提出")
-                    if "confirmed_work_minutes" not in st.session_state:
-                        st.session_state["confirmed_work_minutes"] = {}
                     
                     today_str = datetime.now().strftime('%Y-%m-%d')
                     
-                    staff_date_key = f"{selected_staff}_{today_str}"
-                    existing_data = st.session_state["confirmed_work_minutes"].get(staff_date_key, {})
-                    current_mins = existing_data.get("mins", 0)
+                    # 既にスプレッドシートに登録されている本日の稼働時間を取得
+                    current_mins = 0
+                    if not df_work_hours.empty:
+                        match_row = df_work_hours[(df_work_hours["日付"] == today_str) & (df_work_hours["担当者"] == selected_staff)]
+                        if not match_row.empty:
+                            current_mins = int(match_row.iloc[0]["稼働時間"])
                     
                     c_work1, c_work2 = st.columns([2, 1])
                     with c_work1:
@@ -342,12 +397,12 @@ if spreadsheet_id:
                         st.write("")
                         st.write("")
                         if st.button("✅ 稼働時間を確定・提出する", key=f"btn_confirm_{selected_staff}"):
-                            st.session_state["confirmed_work_minutes"][staff_date_key] = {
-                                "staff": selected_staff,
-                                "date": today_str,
-                                "mins": input_mins
-                            }
-                            st.success(f"{selected_staff} さんの本日({today_str})の稼働時間（{input_mins}分）を提出しました！")
+                            try:
+                                save_work_hour(spreadsheet_id, today_str, selected_staff, input_mins)
+                                st.success(f"スプレッドシートに保存完了！{selected_staff} さんの本日({today_str})の稼働時間（{input_mins}分）を提出しました。")
+                                st.rerun()
+                            except Exception as save_err:
+                                st.error(f"スプレッドシートへの保存に失敗しました: {save_err}")
 
                     # --- B. 当日（本日）の全LP合計 成績表示 ---
                     df_person_today = df_all[(df_all["担当者"] == selected_staff) & (df_all["日付"] == today_str)]
@@ -384,13 +439,19 @@ if spreadsheet_id:
                     if not df_person.empty:
                         df_p_daily = create_summary_table(df_person, "日付")
                         
+                        # スプレッドシートから読み込んだ稼働時間をマージ
                         mins_list = []
                         for _, row in df_p_daily.iterrows():
-                            d_str = row["日付"]
-                            key = f"{selected_staff}_{d_str}"
-                            data = st.session_state["confirmed_work_minutes"].get(key, {})
-                            m_val = data.get("mins", "-")
-                            mins_list.append(f"{m_val}分" if m_val != "-" else "-")
+                            d_str = str(row["日付"])
+                            if not df_work_hours.empty:
+                                m_row = df_work_hours[(df_work_hours["日付"] == d_str) & (df_work_hours["担当者"] == selected_staff)]
+                                if not m_row.empty:
+                                    m_val = m_row.iloc[0]["稼働時間"]
+                                    mins_list.append(f"{m_val}分")
+                                else:
+                                    mins_list.append("-")
+                            else:
+                                mins_list.append("-")
                         
                         df_p_daily.insert(0, "稼働時間", mins_list)
                         st.dataframe(df_p_daily, use_container_width=True)
