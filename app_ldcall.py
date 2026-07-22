@@ -6,7 +6,7 @@ from datetime import datetime, timezone, timedelta
 from google.oauth2.service_account import Credentials
 
 # ページ基本設定
-st.set_page_config(page_title="社内コルセン　ダッシュボード", layout="wide")
+st.set_page_config(page_title="社内コルセンダッシュボード", layout="wide")
 
 # --- 1. 定数設定 ---
 HOURLY_WAGE = 2000              # 時給2,000円
@@ -66,7 +66,7 @@ def load_and_process_all_data(spreadsheet_id):
 
     for ws in worksheets:
         lp_name = ws.title
-        if lp_name == "稼働時間":
+        if lp_name in ["稼働時間", "システム費用"]:
             continue
             
         raw_values = ws.get_all_values()
@@ -101,6 +101,10 @@ def load_and_process_all_data(spreadsheet_id):
 
                 if not date_val or not res_val or res_val == "結果" or not staff_name:
                     continue
+
+                # 💡 k/K を「黒川」に読み替える処理
+                if staff_name.lower() == 'k':
+                    staff_name = "黒川"
 
                 primary_hour = None
                 for char in staff_val:
@@ -142,7 +146,7 @@ def load_and_process_all_data(spreadsheet_id):
                 
     return pd.DataFrame(all_records)
 
-# --- 3. 稼働時間シートの読み込み・書き込み関数 ---
+# --- 3. 稼働時間＆システム費用の読み込み・書き込み関数 ---
 @st.cache_data(ttl=60, show_spinner="稼働時間データを読み込み中...")
 def load_work_hours(spreadsheet_id):
     try:
@@ -154,9 +158,11 @@ def load_work_hours(spreadsheet_id):
         if not df_wh.empty and "日付" in df_wh.columns and "担当者" in df_wh.columns and "稼働時間" in df_wh.columns:
             df_wh["日付"] = df_wh["日付"].astype(str)
             df_wh["担当者"] = df_wh["担当者"].astype(str)
+            # 💡 稼働時間シート内の k/K も「黒川」に統一
+            df_wh["担当者"] = df_wh["担当者"].apply(lambda x: "黒川" if str(x).lower() == 'k' else x)
             df_wh["稼働時間"] = pd.to_numeric(df_wh["稼働時間"], errors='coerce').fillna(0).astype(int)
             return df_wh
-    except Exception as e:
+    except Exception:
         pass
     return pd.DataFrame(columns=["日付", "担当者", "稼働時間"])
 
@@ -172,7 +178,7 @@ def save_work_hour(spreadsheet_id, date_str, staff_name, mins):
         
     row_to_update = None
     for idx, row in enumerate(records[1:], start=2):
-        if len(row) >= 2 and row[0] == date_str and row[1] == staff_name:
+        if len(row) >= 2 and row[0] == date_str and (row[1] == staff_name or (staff_name == "黒川" and row[1].lower() == "k")):
             row_to_update = idx
             break
             
@@ -180,6 +186,49 @@ def save_work_hour(spreadsheet_id, date_str, staff_name, mins):
         ws.update_cell(row_to_update, 3, mins)
     else:
         ws.append_row([date_str, staff_name, mins])
+        
+    st.cache_data.clear()
+
+@st.cache_data(ttl=60, show_spinner="システム費用データを読み込み中...")
+def load_system_costs(spreadsheet_id):
+    try:
+        client = get_gspread_client()
+        sh = client.open_by_key(spreadsheet_id)
+        ws = sh.worksheet("システム費用")
+        records = ws.get_all_records()
+        df_sc = pd.DataFrame(records)
+        if not df_sc.empty and "年月" in df_sc.columns and "システム費用" in df_sc.columns:
+            df_sc["年月"] = df_sc["年月"].astype(str)
+            df_sc["システム費用"] = pd.to_numeric(df_sc["システム費用"], errors='coerce').fillna(0).astype(int)
+            return df_sc
+    except Exception:
+        pass
+    return pd.DataFrame(columns=["年月", "システム費用"])
+
+def save_system_cost(spreadsheet_id, month_str, cost_val):
+    client = get_gspread_client()
+    sh = client.open_by_key(spreadsheet_id)
+    try:
+        ws = sh.worksheet("システム費用")
+    except Exception:
+        ws = sh.add_worksheet(title="システム費用", rows="100", cols="2")
+        ws.append_row(["年月", "システム費用"])
+        
+    records = ws.get_all_values()
+    if not records:
+        ws.append_row(["年月", "システム費用"])
+        records = [["年月", "システム費用"]]
+        
+    row_to_update = None
+    for idx, row in enumerate(records[1:], start=2):
+        if len(row) >= 1 and row[0] == month_str:
+            row_to_update = idx
+            break
+            
+    if row_to_update:
+        ws.update_cell(row_to_update, 2, cost_val)
+    else:
+        ws.append_row([month_str, cost_val])
         
     st.cache_data.clear()
 
@@ -229,6 +278,7 @@ if spreadsheet_id:
     try:
         df_all = load_and_process_all_data(spreadsheet_id)
         df_work_hours = load_work_hours(spreadsheet_id)
+        df_system_costs = load_system_costs(spreadsheet_id)
 
         if not df_all.empty:
             available_months = sorted([m for m in df_all["年月"].unique() if m != "不明"], reverse=True)
@@ -294,31 +344,56 @@ if spreadsheet_id:
 
             # 🔒 管理者専用エリア
             st.markdown("---")
-            with st.expander("🔒 【管理者専用】収益確認 ＆ 担当者別集計表"):
+            with st.expander("🔒 【管理者専用】収益確認 ＆ コスト管理"):
                 input_pass = st.text_input("管理者パスワードを入力してください", type="password", key="admin_pass")
                 if input_pass == ADMIN_PASSWORD:
+                    target_month_for_cost = sel_month if sel_month != "全期間" else (available_months[0] if available_months else "2026-07")
+                    
+                    current_sys_cost = 0
+                    if not df_system_costs.empty:
+                        m_cost = df_system_costs[df_system_costs["年月"] == target_month_for_cost]
+                        if not m_cost.empty:
+                            current_sys_cost = int(m_cost.iloc[0]["システム費用"])
+                            
+                    st.markdown(f"#### ⚙️ 【{target_month_for_cost}】 システム費用 設定")
+                    sc_col1, sc_col2 = st.columns([2, 1])
+                    with sc_col1:
+                        input_sys_cost = st.number_input(f"【{target_month_for_cost}】のシステム費用（円）を入力", min_value=0, value=current_sys_cost, step=1000)
+                    with sc_col2:
+                        st.write("")
+                        st.write("")
+                        if st.button("💾 システム費用を保存", key="btn_save_sys_cost"):
+                            try:
+                                save_system_cost(spreadsheet_id, target_month_for_cost, input_sys_cost)
+                                st.success(f"{target_month_for_cost}のシステム費用（¥{input_sys_cost:,}）を保存しました！")
+                                st.rerun()
+                            except Exception as sys_err:
+                                st.error(f"保存に失敗しました: {sys_err}")
+
+                    st.markdown("---")
+                    st.markdown("#### 💰 収益サマリー")
+                    
+                    # 稼働時間＆人件費計算（黒川さんを除外して計算）
                     if not df_work_hours.empty:
-                        # 全員の総稼働時間（kさん含む）
                         total_mins_all = int(df_work_hours["稼働時間"].sum())
-                        
-                        # 人件費計算用の総稼働時間（kさん除外）
-                        df_wh_cost_target = df_work_hours[df_work_hours["担当者"].str.lower() != 'k']
+                        df_wh_cost_target = df_work_hours[~df_work_hours["担当者"].isin(['黒川', 'k', 'K'])]
                         total_mins_cost_target = int(df_wh_cost_target["稼働時間"].sum())
                     else:
                         total_mins_all = 0
                         total_mins_cost_target = 0
                         
                     total_hours_all = round(total_mins_all / 60, 2)
-                    total_cost = total_mins_cost_target * MINUTE_WAGE
-                    
+                    total_labor_cost = total_mins_cost_target * MINUTE_WAGE
                     total_revenue = total_docs * DOCUMENT_UNIT_PRICE
-                    profit = total_revenue - total_cost
+                    
+                    profit = total_revenue - (total_labor_cost + current_sys_cost)
 
-                    m1, m2, m3, m4 = st.columns(4)
+                    m1, m2, m3, m4, m5 = st.columns(5)
                     m1.metric("確定売上 (資料数×4,500円)", f"¥{total_revenue:,}")
-                    m2.metric("総稼働時間 (全員分)", f"{total_mins_all:,}分 ({total_hours_all}時間)")
-                    m3.metric("概算人件費 (kさん除外)", f"¥{int(total_cost):,}")
-                    m4.metric("推定粗利益", f"¥{int(profit):,}")
+                    m2.metric("総稼働時間 (全員分)", f"{total_mins_all:,}分 ({total_hours_all}h)")
+                    m3.metric("概算人件費 (黒川さん除外)", f"¥{int(total_labor_cost):,}")
+                    m4.metric("システム費用", f"¥{current_sys_cost:,}")
+                    m5.metric("推定粗利益", f"¥{int(profit):,}")
 
                     st.markdown("---")
                     st.subheader("👥 担当者別 集計表")
@@ -375,12 +450,13 @@ if spreadsheet_id:
                 st.info(f"🔒 **{selected_staff}** さんのパスワードを入力してください。")
                 input_user_pass = st.text_input(f"{selected_staff} さんのパスワード", type="password", key=f"pass_{selected_staff}")
                 
-                correct_pass = USER_PASSWORDS.get(selected_staff, "")
+                # secrets.tomlで「黒川」あるいは「k」どちらのキーで設定されていても対応可能に
+                correct_pass = USER_PASSWORDS.get(selected_staff, USER_PASSWORDS.get("k", ""))
                 
                 if input_user_pass != "" and (input_user_pass == correct_pass or input_user_pass == ADMIN_PASSWORD):
                     st.success("認証されました！")
                     
-                    # --- A. 稼働時間入力 ＆ 確定登録 (JST対応) ---
+                    # --- A. 稼働時間入力 ＆ 確定登録 ---
                     st.markdown("---")
                     st.markdown("#### ✍️ 本日の稼働時間 提出")
                     
