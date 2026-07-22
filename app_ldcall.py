@@ -20,7 +20,7 @@ ADMIN_PASSWORD = USER_PASSWORDS.get("admin", "admin123")
 # パスワード設定されているメンバー一覧（adminは除く）
 REGISTERED_MEMBERS = [k for k in USER_PASSWORDS.keys() if k.lower() != "admin"]
 
-st.title("📞 社内コルセン　ダッシュボード")
+st.title("📞 社内コルセンダッシュボード")
 
 # --- 日付パース用の補助関数 ---
 def parse_custom_date(date_str):
@@ -298,21 +298,26 @@ if spreadsheet_id:
                 input_pass = st.text_input("管理者パスワードを入力してください", type="password", key="admin_pass")
                 if input_pass == ADMIN_PASSWORD:
                     if not df_work_hours.empty:
-                        df_wh_filtered = df_work_hours[df_work_hours["担当者"].str.lower() != 'k']
-                        total_mins = int(df_wh_filtered["稼働時間"].sum())
-                    else:
-                        total_mins = 0
+                        # 全員の総稼働時間（kさん含む）
+                        total_mins_all = int(df_work_hours["稼働時間"].sum())
                         
-                    total_hours = round(total_mins / 60, 2)
-                    total_cost = total_mins * MINUTE_WAGE
+                        # 人件費計算用の総稼働時間（kさん除外）
+                        df_wh_cost_target = df_work_hours[df_work_hours["担当者"].str.lower() != 'k']
+                        total_mins_cost_target = int(df_wh_cost_target["稼働時間"].sum())
+                    else:
+                        total_mins_all = 0
+                        total_mins_cost_target = 0
+                        
+                    total_hours_all = round(total_mins_all / 60, 2)
+                    total_cost = total_mins_cost_target * MINUTE_WAGE
                     
                     total_revenue = total_docs * DOCUMENT_UNIT_PRICE
                     profit = total_revenue - total_cost
 
                     m1, m2, m3, m4 = st.columns(4)
                     m1.metric("確定売上 (資料数×4,500円)", f"¥{total_revenue:,}")
-                    m2.metric("総稼働時間 (kさん除外)", f"{total_mins:,}分 ({total_hours}時間)")
-                    m3.metric("概算人件費", f"¥{int(total_cost):,}")
+                    m2.metric("総稼働時間 (全員分)", f"{total_mins_all:,}分 ({total_hours_all}時間)")
+                    m3.metric("概算人件費 (kさん除外)", f"¥{int(total_cost):,}")
                     m4.metric("推定粗利益", f"¥{int(profit):,}")
 
                     st.markdown("---")
@@ -375,11 +380,10 @@ if spreadsheet_id:
                 if input_user_pass != "" and (input_user_pass == correct_pass or input_user_pass == ADMIN_PASSWORD):
                     st.success("認証されました！")
                     
-                    # --- A. 稼働時間入力 ＆ 確定登録 (日本時間 JST 対応) ---
+                    # --- A. 稼働時間入力 ＆ 確定登録 (JST対応) ---
                     st.markdown("---")
                     st.markdown("#### ✍️ 本日の稼働時間 提出")
                     
-                    # 💡 日本時間で今日の日付を取得
                     today_str = datetime.now(JST).strftime('%Y-%m-%d')
                     
                     current_mins = 0
@@ -397,10 +401,10 @@ if spreadsheet_id:
                         if st.button("✅ 稼働時間を確定・提出する", key=f"btn_confirm_{selected_staff}"):
                             try:
                                 save_work_hour(spreadsheet_id, today_str, selected_staff, input_mins)
-                                st.success(f"保存完了！{selected_staff} さんの本日({today_str})の稼働時間（{input_mins}分）を提出しました。")
+                                st.success(f"スプレッドシートに保存完了！{selected_staff} さんの本日({today_str})の稼働時間（{input_mins}分）を提出しました。")
                                 st.rerun()
                             except Exception as save_err:
-                                st.error(f"保存に失敗しました: {save_err}")
+                                st.error(f"スプレッドシートへの保存に失敗しました: {save_err}")
 
                     # --- B. 当日（本日）の全LP合計 成績表示 ---
                     df_person_today = df_all[(df_all["担当者"] == selected_staff) & (df_all["日付"] == today_str)]
