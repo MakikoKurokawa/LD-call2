@@ -2,16 +2,17 @@ import streamlit as st
 import pandas as pd
 import re
 import gspread
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from google.oauth2.service_account import Credentials
 
 # ページ基本設定
-st.set_page_config(page_title="コール分析＆収益管理ダッシュボード", layout="wide")
+st.set_page_config(page_title="社内コルセン　ダッシュボード", layout="wide")
 
 # --- 1. 定数設定 ---
 HOURLY_WAGE = 2000              # 時給2,000円
 MINUTE_WAGE = HOURLY_WAGE / 60  # 分単価
 DOCUMENT_UNIT_PRICE = 4500      # 資料1件あたりの売上単価 (4,500円)
+JST = timezone(timedelta(hours=9)) # 日本時間(JST)の設定
 
 USER_PASSWORDS = st.secrets.get("passwords", {"admin": "admin123"})
 ADMIN_PASSWORD = USER_PASSWORDS.get("admin", "admin123")
@@ -19,7 +20,7 @@ ADMIN_PASSWORD = USER_PASSWORDS.get("admin", "admin123")
 # パスワード設定されているメンバー一覧（adminは除く）
 REGISTERED_MEMBERS = [k for k in USER_PASSWORDS.keys() if k.lower() != "admin"]
 
-st.title("📞 コール分析＆収益管理ダッシュボード")
+st.title("📞 社内コルセン　ダッシュボード")
 
 # --- 日付パース用の補助関数 ---
 def parse_custom_date(date_str):
@@ -43,7 +44,6 @@ def parse_custom_date(date_str):
 
 # --- GSpread認証クライアント取得関数 ---
 def get_gspread_client():
-    # 書き込みも行うため drive / spreadsheets スコープを指定
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive"
@@ -66,7 +66,7 @@ def load_and_process_all_data(spreadsheet_id):
 
     for ws in worksheets:
         lp_name = ws.title
-        if lp_name == "稼働時間":  # 稼働時間シートはコールデータの読み込み対象外
+        if lp_name == "稼働時間":
             continue
             
         raw_values = ws.get_all_values()
@@ -234,7 +234,6 @@ if spreadsheet_id:
             available_months = sorted([m for m in df_all["年月"].unique() if m != "不明"], reverse=True)
             lp_list = ["全LP合計"] + sorted([str(x) for x in df_all["LP"].unique()])
             
-            # 【担当者絞り込みロジック】
             recent_2_months = available_months[:2] if len(available_months) >= 2 else available_months
             df_recent = df_all[df_all["年月"].isin(recent_2_months)]
             recent_active_staffs = df_recent["担当者"].unique()
@@ -298,7 +297,6 @@ if spreadsheet_id:
             with st.expander("🔒 【管理者専用】収益確認 ＆ 担当者別集計表"):
                 input_pass = st.text_input("管理者パスワードを入力してください", type="password", key="admin_pass")
                 if input_pass == ADMIN_PASSWORD:
-                    # スプレッドシートから読み込んだ稼働時間で集計（kさん除外）
                     if not df_work_hours.empty:
                         df_wh_filtered = df_work_hours[df_work_hours["担当者"].str.lower() != 'k']
                         total_mins = int(df_wh_filtered["稼働時間"].sum())
@@ -377,13 +375,13 @@ if spreadsheet_id:
                 if input_user_pass != "" and (input_user_pass == correct_pass or input_user_pass == ADMIN_PASSWORD):
                     st.success("認証されました！")
                     
-                    # --- A. 稼働時間入力 ＆ 確定登録 (スプレッドシート永続化) ---
+                    # --- A. 稼働時間入力 ＆ 確定登録 (日本時間 JST 対応) ---
                     st.markdown("---")
                     st.markdown("#### ✍️ 本日の稼働時間 提出")
                     
-                    today_str = datetime.now().strftime('%Y-%m-%d')
+                    # 💡 日本時間で今日の日付を取得
+                    today_str = datetime.now(JST).strftime('%Y-%m-%d')
                     
-                    # 既にスプレッドシートに登録されている本日の稼働時間を取得
                     current_mins = 0
                     if not df_work_hours.empty:
                         match_row = df_work_hours[(df_work_hours["日付"] == today_str) & (df_work_hours["担当者"] == selected_staff)]
@@ -439,7 +437,6 @@ if spreadsheet_id:
                     if not df_person.empty:
                         df_p_daily = create_summary_table(df_person, "日付")
                         
-                        # スプレッドシートから読み込んだ稼働時間をマージ
                         mins_list = []
                         for _, row in df_p_daily.iterrows():
                             d_str = str(row["日付"])
