@@ -16,6 +16,9 @@ DOCUMENT_UNIT_PRICE = 4500      # 資料1件あたりの売上単価 (4,500円)
 USER_PASSWORDS = st.secrets.get("passwords", {"admin": "admin123"})
 ADMIN_PASSWORD = USER_PASSWORDS.get("admin", "admin123")
 
+# 💡 パスワード設定されているメンバー一覧（adminは除く）
+REGISTERED_MEMBERS = [k for k in USER_PASSWORDS.keys() if k.lower() != "admin"]
+
 st.title("📞 コール分析＆収益管理ダッシュボード")
 
 # --- 日付パース用の補助関数 ---
@@ -129,7 +132,7 @@ def load_and_process_all_data(spreadsheet_id):
                 
     return pd.DataFrame(all_records)
 
-# --- 集計テーブル作成ヘルパー関数（単位＆小数第2位フォーマット対応） ---
+# --- 集計テーブル作成ヘルパー関数 ---
 def create_summary_table(df, group_col, raw_mode=False):
     if df.empty:
         return pd.DataFrame()
@@ -148,7 +151,6 @@ def create_summary_table(df, group_col, raw_mode=False):
     if raw_mode:
         return summary
 
-    # 表示用に「件」や「.00%」を付与
     formatted = summary.copy()
     formatted["架電数"] = formatted["架電数"].apply(lambda x: f"{x:,}件")
     formatted["通電数"] = formatted["通電数"].apply(lambda x: f"{x:,}件")
@@ -159,7 +161,6 @@ def create_summary_table(df, group_col, raw_mode=False):
     formatted["通電CVR"] = formatted["通電CVR(%)"].apply(lambda x: f"{x:.2f}%")
     formatted["架電CVR"] = formatted["架電CVR(%)"].apply(lambda x: f"{x:.2f}%")
     
-    # 元の未加工数値列をドロップして並び替え
     formatted = formatted.drop(columns=["通電率(%)", "通電CVR(%)", "架電CVR(%)"])
     cols = [group_col, "架電数", "通電数", "通電率", "CV数", "通電CVR", "架電CVR", "獲得資料数"]
     
@@ -180,7 +181,18 @@ if spreadsheet_id:
         if not df_all.empty:
             available_months = sorted([m for m in df_all["年月"].unique() if m != "不明"], reverse=True)
             lp_list = ["全LP合計"] + sorted([str(x) for x in df_all["LP"].unique()])
-            all_staffs = sorted([s for s in df_all["担当者"].unique() if s != "不明"])
+            
+            # 💡【担当者絞り込みロジック】
+            # 直近2ヶ月（最新月とその前の月）を取得
+            recent_2_months = available_months[:2] if len(available_months) >= 2 else available_months
+            df_recent = df_all[df_all["年月"].isin(recent_2_months)]
+            recent_active_staffs = df_recent["担当者"].unique()
+            
+            # 「secrets.tomlに登録がある人」かつ「直近2ヶ月で1件以上架電実績がある人」のみに限定
+            if REGISTERED_MEMBERS:
+                all_staffs = sorted([s for s in REGISTERED_MEMBERS if s in recent_active_staffs])
+            else:
+                all_staffs = sorted([s for s in recent_active_staffs if s != "不明"])
         else:
             available_months, lp_list, all_staffs = [], ["全LP合計"], []
 
@@ -236,7 +248,6 @@ if spreadsheet_id:
             with st.expander("🔒 【管理者専用】収益確認 ＆ 担当者別集計表"):
                 input_pass = st.text_input("管理者パスワードを入力してください", type="password", key="admin_pass")
                 if input_pass == ADMIN_PASSWORD:
-                    # 💡 稼働時間（分）と人件費の集計
                     confirmed_mins_dict = st.session_state.get("confirmed_work_minutes", {})
                     
                     total_mins = sum(data.get("mins", 0) for staff, data in confirmed_mins_dict.items() if staff.lower() != 'k')
@@ -296,8 +307,13 @@ if spreadsheet_id:
         # ==========================================
         with tab3:
             st.subheader("👤 個人成績 ＆ 本日の日報提出")
-            selected_staff = st.selectbox("担当者を選択してください", all_staffs)
             
+            if all_staffs:
+                selected_staff = st.selectbox("担当者を選択してください", all_staffs)
+            else:
+                selected_staff = None
+                st.warning("対象となるアクティブな担当者が見つかりません。secrets.tomlの設定をご確認ください。")
+
             if selected_staff:
                 st.info(f"🔒 **{selected_staff}** さんのパスワードを入力してください。")
                 input_user_pass = st.text_input(f"{selected_staff} さんのパスワード", type="password", key=f"pass_{selected_staff}")
@@ -315,7 +331,6 @@ if spreadsheet_id:
                     
                     today_str = datetime.now().strftime('%Y-%m-%d')
                     
-                    # 記録キー: (担当者名, 日付)
                     staff_date_key = f"{selected_staff}_{today_str}"
                     existing_data = st.session_state["confirmed_work_minutes"].get(staff_date_key, {})
                     current_mins = existing_data.get("mins", 0)
@@ -356,7 +371,7 @@ if spreadsheet_id:
                     st.code(slack_text, language="markdown")
                     st.caption("💡 右上のアイコンでテキストをコピーし、自分のSlackにペーストして投稿してください。")
 
-                    # --- D. 個人用：日別パフォーマンス表（提出済み稼働時間付き） ---
+                    # --- D. 個人用：日別パフォーマンス表 ---
                     st.markdown("---")
                     st.subheader(f"📅 {selected_staff} さんの日別パフォーマンス表")
                     
@@ -367,10 +382,8 @@ if spreadsheet_id:
                         df_person = df_person[df_person["年月"] == p_sel_month]
 
                     if not df_person.empty:
-                        # 日別集計テーブル作成
                         df_p_daily = create_summary_table(df_person, "日付")
                         
-                        # 💡 稼働時間（分）を日付の左側にマージ
                         mins_list = []
                         for _, row in df_p_daily.iterrows():
                             d_str = row["日付"]
