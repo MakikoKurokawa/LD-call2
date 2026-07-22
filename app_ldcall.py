@@ -17,10 +17,9 @@ ADMIN_PASSWORD = USER_PASSWORDS.get("admin", "admin123")
 
 st.title("📞 コール分析＆収益管理ダッシュボード")
 
-# --- 2. スプレッドシート読み込み＆前処理の統合キャッシュ化 ---
+# --- 2. スプレッドシート読み込み＆前処理 ---
 @st.cache_data(ttl=600, show_spinner="スプレッドシートから高速データ取得中...")
 def load_and_process_all_data(spreadsheet_id):
-    """Googleスプレッドシートを取得し、前処理まで完了した状態でキャッシュする"""
     scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
     creds_dict = dict(st.secrets["gcp_service_account"])
     creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
@@ -32,25 +31,27 @@ def load_and_process_all_data(spreadsheet_id):
     all_records = []
     
     # 0始まりの列インデックス
-    # A=0, B=1, C=2, D=3, E=4, F=5, G=6, H=7...
+    # 1巡目: C(2), D(3), E(4), H(7)
+    # 2巡目: I(8), J(9), K(10), N(13)
+    # 3巡目: O(14), P(15), Q(16), T(19)
+    # 4巡目: U(20), V(21), W(22), Z(25)
     call_pairs = [
-        (2, 3, 4, 7),     # 1巡目: C, D, E, H
-        (8, 9, 10, 13),   # 2巡目: I, J, K, N
-        (14, 15, 16, 19), # 3巡目: O, P, Q, T
-        (20, 21, 22, 25)  # 4巡目: U, V, W, Z
+        (2, 3, 4, 7),
+        (8, 9, 10, 13),
+        (14, 15, 16, 19),
+        (20, 21, 22, 25)
     ]
     
     circle_num_map = {'⑨': 9, '⑩': 10, '⑪': 11, '⑫': 12, '⑬': 13, '⑭': 14, '⑮': 15, '⑯': 16, '⑰': 17, '⑱': 18}
+    result_keywords = ["NG", "ng", "Ng", "許諾", "不通", "留守", "着拒", "繋がらない", "折TEL", "折tel", "結果", "キャンセル"]
 
     for ws in worksheets:
         lp_name = ws.title
         raw_values = ws.get_all_values()
         
-        # データ行がない場合はスキップ
         if len(raw_values) <= 1:
             continue
             
-        # 1行目（インデックス1）以降のデータ行をループ
         for row in raw_values[1:]:
             if not row or not any(row):
                 continue
@@ -58,27 +59,31 @@ def load_and_process_all_data(spreadsheet_id):
             current_lp = str(row[0]).strip() if len(row) > 0 and pd.notnull(row[0]) and str(row[0]).strip() != "" else lp_name
             
             for idx_call, (col_date, col_res, col_staff, col_note) in enumerate(call_pairs, 1):
-                # 配列の長さが足りない場合はスキップ
                 if len(row) <= max(col_date, col_res, col_staff, col_note):
                     continue
                 
-                res_val = str(row[col_res]).strip() if row[col_res] else ""
-                # 結果が入っていない、またはヘッダー文字の場合はスキップ
-                if not res_val or res_val == "結果":
-                    continue
-                    
                 date_val = str(row[col_date]).strip() if row[col_date] else ""
+                res_val = str(row[col_res]).strip() if row[col_res] else ""
                 staff_val = str(row[col_staff]).strip() if row[col_staff] else ""
                 note_val = str(row[col_note]).strip() if row[col_note] else ""
                 
-                # A. 担当者名 (r除外)
-                match_name = re.match(r'^([^\d①-⑳]+)', staff_val)
-                if match_name:
-                    staff_name = match_name.group(1).replace('r', '').strip()
-                else:
-                    staff_name = "不明" if not staff_val else staff_val
-                
-                # B. 時間帯 (1つ目の数字を適用)
+                # --- A. 担当者名の抽出＆フィルタリング ---
+                staff_name = ""
+                if staff_val:
+                    match_name = re.match(r'^([^\d①-⑳]+)', staff_val)
+                    if match_name:
+                        temp_name = match_name.group(1).replace('r', '').strip()
+                        if not any(kw in temp_name for kw in result_keywords):
+                            staff_name = temp_name
+                    else:
+                        if not any(kw in staff_val for kw in result_keywords):
+                            staff_name = staff_val.replace('r', '').strip()
+
+                # 💡 必須判定：「日付」「結果」「担当者」の3つがすべて揃っていない場合はスキップ
+                if not date_val or not res_val or res_val == "結果" or not staff_name:
+                    continue
+
+                # --- B. 時間帯 (1つ目の数字を適用) ---
                 primary_hour = None
                 for char in staff_val:
                     if char in circle_num_map:
@@ -90,7 +95,7 @@ def load_and_process_all_data(spreadsheet_id):
                     if valid_digits:
                         primary_hour = valid_digits[0]
                 
-                # C. 資料数
+                # --- C. 資料数 ---
                 doc_count = 0
                 if note_val.isdigit():
                     doc_count = int(note_val)
@@ -99,11 +104,11 @@ def load_and_process_all_data(spreadsheet_id):
                     if doc_digits:
                         doc_count = int(doc_digits[0])
                 
-                # D. フラグ判定
+                # --- D. フラグ判定 ---
                 is_cv = 1 if "許諾" in res_val else 0
                 is_connected = 0 if any(ng in res_val for ng in ["繋がらない", "NG", "不通", "留守", "着拒"]) else 1
                 
-                # E. 月情報
+                # --- E. 月情報 ---
                 month_str = "不明"
                 if date_val:
                     parsed_date = pd.to_datetime(date_val, errors='coerce')
@@ -134,11 +139,9 @@ if st.sidebar.button("🔄 データを最新に更新"):
 
 if spreadsheet_id:
     try:
-        # 一括高速読み込み＆前処理
         df_all = load_and_process_all_data(spreadsheet_id)
 
         if not df_all.empty:
-            # LP選択フィルター
             lp_list = ["全LP合計"] + sorted([str(x) for x in df_all["LP"].unique()])
             selected_lp = st.sidebar.selectbox("対象LP（タブ）を選択", lp_list)
             
@@ -147,7 +150,6 @@ if spreadsheet_id:
             else:
                 df_lp = df_all
 
-            # 月選択フィルター
             available_months = sorted([m for m in df_lp["年月"].unique() if m != "不明"], reverse=True)
             selected_month = st.sidebar.selectbox("対象月を選択", ["全期間"] + available_months)
             
@@ -187,7 +189,7 @@ if spreadsheet_id:
             c3.metric("CV(許諾)数", f"{total_cv:,} 件")
             c4.metric("獲得資料数", f"{total_docs:,} 件")
 
-            # 💡 管理者専用 収益エリア
+            # 🔒 管理者専用 収益エリア
             st.markdown("---")
             with st.expander("🔒 【管理者専用】売上・人件費・利益の確認"):
                 input_pass = st.text_input("管理者パスワードを入力してください", type="password", key="admin_pass")
