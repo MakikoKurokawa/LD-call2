@@ -5,7 +5,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 # ページ基本設定
-st.set_page_config(page_title="コール分析＆集計ダッシュボード", layout="wide")
+st.set_page_config(page_title="コール分析＆収益管理ダッシュボード", layout="wide")
 
 # --- 1. 定数設定 ---
 HOURLY_WAGE = 2000              # 時給2,000円
@@ -15,7 +15,7 @@ DOCUMENT_UNIT_PRICE = 4500      # 資料1件あたりの売上単価 (4,500円)
 USER_PASSWORDS = st.secrets.get("passwords", {"admin": "admin123"})
 ADMIN_PASSWORD = USER_PASSWORDS.get("admin", "admin123")
 
-st.title("📞 コール分析＆集計ダッシュボード")
+st.title("📞 コール分析＆収益管理ダッシュボード")
 
 # --- 2. スプレッドシート読み込み＆前処理の統合キャッシュ化 ---
 @st.cache_data(ttl=600, show_spinner="スプレッドシートから高速データ取得中...")
@@ -31,16 +31,13 @@ def load_and_process_all_data(spreadsheet_id):
     
     all_records = []
     
-    # 巡目と列インデックス（0開始）
-    # 1巡目: C(2)=日付, D(3)=結果, E(4)=担当, H(7)=備考
-    # 2巡目: I(8)=日付, J(9)=結果, K(10)=担当, N(13)=備考
-    # 3巡目: O(14)=日付, P(15)=結果, Q(16)=担当, T(19)=備考
-    # 4巡目: U(20)=日付, V(21)=結果, W(22)=担当, Z(25)=備考
+    # 0始まりの列インデックス
+    # A=0, B=1, C=2, D=3, E=4, F=5, G=6, H=7...
     call_pairs = [
-        (2, 3, 4, 7),
-        (8, 9, 10, 13),
-        (14, 15, 16, 19),
-        (20, 21, 22, 25)
+        (2, 3, 4, 7),     # 1巡目: C, D, E, H
+        (8, 9, 10, 13),   # 2巡目: I, J, K, N
+        (14, 15, 16, 19), # 3巡目: O, P, Q, T
+        (20, 21, 22, 25)  # 4巡目: U, V, W, Z
     ]
     
     circle_num_map = {'⑨': 9, '⑩': 10, '⑪': 11, '⑫': 12, '⑬': 13, '⑭': 14, '⑮': 15, '⑯': 16, '⑰': 17, '⑱': 18}
@@ -48,21 +45,25 @@ def load_and_process_all_data(spreadsheet_id):
     for ws in worksheets:
         lp_name = ws.title
         raw_values = ws.get_all_values()
+        
+        # データ行がない場合はスキップ
         if len(raw_values) <= 1:
             continue
             
-        # 1行目以降（ヘッダー除外）を処理
+        # 1行目（インデックス1）以降のデータ行をループ
         for row in raw_values[1:]:
             if not row or not any(row):
                 continue
                 
-            current_lp = str(row[0]).strip() if pd.notnull(row[0]) and str(row[0]).strip() != "" else lp_name
+            current_lp = str(row[0]).strip() if len(row) > 0 and pd.notnull(row[0]) and str(row[0]).strip() != "" else lp_name
             
             for idx_call, (col_date, col_res, col_staff, col_note) in enumerate(call_pairs, 1):
-                if len(row) <= col_note:
+                # 配列の長さが足りない場合はスキップ
+                if len(row) <= max(col_date, col_res, col_staff, col_note):
                     continue
                 
                 res_val = str(row[col_res]).strip() if row[col_res] else ""
+                # 結果が入っていない、またはヘッダー文字の場合はスキップ
                 if not res_val or res_val == "結果":
                     continue
                     
@@ -77,7 +78,7 @@ def load_and_process_all_data(spreadsheet_id):
                 else:
                     staff_name = "不明" if not staff_val else staff_val
                 
-                # B. 時間帯 (1つ目の数字)
+                # B. 時間帯 (1つ目の数字を適用)
                 primary_hour = None
                 for char in staff_val:
                     if char in circle_num_map:
@@ -98,7 +99,7 @@ def load_and_process_all_data(spreadsheet_id):
                     if doc_digits:
                         doc_count = int(doc_digits[0])
                 
-                # D. フラグ
+                # D. フラグ判定
                 is_cv = 1 if "許諾" in res_val else 0
                 is_connected = 0 if any(ng in res_val for ng in ["繋がらない", "NG", "不通", "留守", "着拒"]) else 1
                 
@@ -133,12 +134,12 @@ if st.sidebar.button("🔄 データを最新に更新"):
 
 if spreadsheet_id:
     try:
-        # データ取得 ＆ 前処理を一括キャッシュ処理
+        # 一括高速読み込み＆前処理
         df_all = load_and_process_all_data(spreadsheet_id)
 
         if not df_all.empty:
             # LP選択フィルター
-            lp_list = ["全LP合計"] + sorted(list(df_all["LP"].unique()))
+            lp_list = ["全LP合計"] + sorted([str(x) for x in df_all["LP"].unique()])
             selected_lp = st.sidebar.selectbox("対象LP（タブ）を選択", lp_list)
             
             if selected_lp != "全LP合計":
