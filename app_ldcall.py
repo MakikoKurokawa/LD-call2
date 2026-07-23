@@ -477,10 +477,10 @@ if spreadsheet_id:
                         if st.button("✅ 稼働時間を確定・提出する", key=f"btn_confirm_{selected_staff}"):
                             try:
                                 save_work_hour(spreadsheet_id, today_str, selected_staff, input_mins)
-                                st.success(f"スプレッドシートに保存完了！{selected_staff} さんの本日({today_str})の稼働時間（{input_mins}分）を提出しました。")
+                                st.success(f"保存完了！{selected_staff} さんの本日({today_str})の稼働時間（{input_mins}分）を提出しました。")
                                 st.rerun()
                             except Exception as save_err:
-                                st.error(f"スプレッドシートへの保存に失敗しました: {save_err}")
+                                st.error(f"保存に失敗しました: {save_err}")
 
                     # --- B. 当日（本日）の全LP合計 成績表示 ---
                     df_person_today = df_all[(df_all["担当者"] == selected_staff) & (df_all["日付"] == today_str)]
