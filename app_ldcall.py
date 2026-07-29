@@ -24,16 +24,12 @@ REGISTERED_MEMBERS = [k for k in USER_PASSWORDS.keys() if k.lower() != "admin"]
 st.title("📞 社内コルセンダッシュボード")
 
 # --- 営業日数計算用の補助関数 (土日＋簡易日本の祝日判定) ---
-def get_business_days_info(year, month, today_date, adjust_days=0):
-    # 月の全日付を取得
+def get_business_days_info(year, month, target_cutoff_date, adjust_days=0):
     _, last_day = calendar.monthrange(year, month)
     
-    # 固定祝日・簡易判定（ハッピーマンデー等含む一般的な祝日リスト）
-    # ※厳密な祝日算出のため簡易ロジックを実装
     def is_holiday(d):
         if d.weekday() >= 5: # 土日
             return True
-        # 固定祝日
         m, day = d.month, d.day
         fixed_holidays = [
             (1,1), (1,2), (1,3), (2,11), (2,23), (4,29), (5,3), (5,4), (5,5),
@@ -41,7 +37,6 @@ def get_business_days_info(year, month, today_date, adjust_days=0):
         ]
         if (m, day) in fixed_holidays:
             return True
-        # 成人の日(1月第2月曜), 海の日(7月第3月曜), 敬老の日(9月第3月曜), 体育/スポーツの日(10月第2月曜)
         if m == 1 and d.weekday() == 0 and 8 <= day <= 14: return True
         if m == 7 and d.weekday() == 0 and 15 <= day <= 21: return True
         if m == 9 and d.weekday() == 0 and 15 <= day <= 21: return True
@@ -55,10 +50,9 @@ def get_business_days_info(year, month, today_date, adjust_days=0):
         cur_d = date(year, month, day_num)
         if not is_holiday(cur_d):
             total_b_days += 1
-            if cur_d <= today_date:
+            if cur_d <= target_cutoff_date:
                 passed_b_days += 1
 
-    # 手動補正を加味（0日割り算防止のため最小1日）
     final_total_b_days = max(1, total_b_days + adjust_days)
     final_passed_b_days = max(1, min(passed_b_days, final_total_b_days))
     
@@ -410,54 +404,71 @@ if spreadsheet_id:
                     with sc_col2:
                         adjust_b_days = st.number_input("営業日数 補正（日）※特別休業などはマイナス指定", value=0, step=1, help="例: 年末年始などで平日を2日休業にする場合は「-2」と指定")
 
-                    # 💡 着地予想の計算処理
+                    # 💡 16:00 締め切り基準の着地予想ロジック
                     now_jst = datetime.now(JST)
                     try:
                         y_val, m_val = map(int, target_month_for_cost.split('-'))
                     except Exception:
                         y_val, m_val = now_jst.year, now_jst.month
 
-                    # 過去月の場合は月最終日、当月の場合は今日の日付を基準にする
-                    if (y_val < now_jst.year) or (y_val == now_jst.year and m_val < now_jst.month):
+                    # 過去月か当月かの判定
+                    is_past_month = (y_val < now_jst.year) or (y_val == now_jst.year and m_val < now_jst.month)
+
+                    if is_past_month:
                         _, last_d = calendar.monthrange(y_val, m_val)
-                        ref_date = date(y_val, m_val, last_d)
+                        cutoff_date = date(y_val, m_val, last_d)
                     else:
-                        ref_date = now_jst.date()
+                        # 当月の場合: 16時前なら前日、16時以降なら本日を基準日とする
+                        if now_jst.hour < 16:
+                            cutoff_date = (now_jst - timedelta(days=1)).date()
+                        else:
+                            cutoff_date = now_jst.date()
 
-                    passed_days, total_b_days = get_business_days_info(y_val, m_val, ref_date, adjust_b_days)
+                    passed_days, total_b_days = get_business_days_info(y_val, m_val, cutoff_date, adjust_b_days)
+                    cutoff_date_str = cutoff_date.strftime('%Y-%m-%d')
 
-                    st.markdown("---")
-                    st.markdown(f"#### 📈 収益サマリー ＆ 月末着地予想（{target_month_for_cost}）")
-                    
-                    # 稼働時間＆人件費計算（黒川さん除外）
+                    # 着地計算用のデータフィルタリング（16時前なら前日分までのデータのみ抽出）
+                    df_proj_t1 = df_t1[df_t1["日付"] <= cutoff_date_str] if not is_past_month else df_t1
+                    proj_docs = df_proj_t1["資料数"].sum() if not df_proj_t1.empty else 0
+                    proj_revenue = proj_docs * DOCUMENT_UNIT_PRICE
+
+                    # 人件費計算（16時前なら前日分までの稼働時間のみ抽出）
                     if not df_work_hours.empty:
-                        total_mins_all = int(df_work_hours["稼働時間"].sum())
-                        df_wh_cost_target = df_work_hours[~df_work_hours["担当者"].isin(['黒川', 'k', 'K'])]
-                        total_mins_cost_target = int(df_wh_cost_target["稼働時間"].sum())
+                        df_wh_filtered = df_work_hours if is_past_month else df_work_hours[df_work_hours["日付"] <= cutoff_date_str]
+                        df_wh_cost_target = df_wh_filtered[~df_wh_filtered["担当者"].isin(['黒川', 'k', 'K'])]
+                        proj_labor_cost = int(df_wh_cost_target["稼働時間"].sum()) * MINUTE_WAGE
                     else:
-                        total_mins_all = 0
-                        total_mins_cost_target = 0
-                        
-                    total_hours_all = round(total_mins_all / 60, 2)
-                    total_labor_cost = total_mins_cost_target * MINUTE_WAGE
-                    total_revenue = total_docs * DOCUMENT_UNIT_PRICE
-                    
-                    # 現在時点の粗利益
-                    current_profit = total_revenue - (total_labor_cost + current_sys_cost)
+                        proj_labor_cost = 0
 
-                    # --- 着地予想計算 ---
-                    daily_avg_revenue = total_revenue / passed_days
-                    daily_avg_labor_cost = total_labor_cost / passed_days
-                    
+                    # 経過日数時点の実効デイリー平均
+                    daily_avg_revenue = proj_revenue / passed_days
+                    daily_avg_labor_cost = proj_labor_cost / passed_days
+
+                    # 月末着地数値
                     projected_revenue = int(daily_avg_revenue * total_b_days)
                     projected_labor_cost = int(daily_avg_labor_cost * total_b_days)
                     projected_profit = projected_revenue - (projected_labor_cost + current_sys_cost)
 
-                    st.caption(f"🗓 営業日数: **{passed_days} 日** 消化 / **{total_b_days} 日** 中 （デイリー平均売上: **¥{int(daily_avg_revenue):,}** /日）")
+                    # 全体実績（確定値）
+                    total_revenue = total_docs * DOCUMENT_UNIT_PRICE
+                    if not df_work_hours.empty:
+                        total_mins_all = int(df_work_hours["稼働時間"].sum())
+                        df_wh_cost_all = df_work_hours[~df_work_hours["担当者"].isin(['黒川', 'k', 'K'])]
+                        total_labor_cost = int(df_wh_cost_all["稼働時間"].sum()) * MINUTE_WAGE
+                    else:
+                        total_mins_all = 0
+                        total_labor_cost = 0
+                        
+                    total_hours_all = round(total_mins_all / 60, 2)
+                    current_profit = total_revenue - (total_labor_cost + current_sys_cost)
+
+                    st.markdown("---")
+                    st.markdown(f"#### 📈 収益サマリー ＆ 月末着地予想（{target_month_for_cost}）")
+                    st.caption(f"⏰ 基準日: **{cutoff_date_str}** 時点（毎日 16:00 に当日分へ更新）｜ 営業日数: **{passed_days} 日** 消化 / **{total_b_days} 日** 中（平均売上: **¥{int(daily_avg_revenue):,}** /日）")
 
                     m1, m2, m3, m4 = st.columns(4)
                     m1.metric("確定売上 (現時点)", f"¥{total_revenue:,}", delta=f"着地予想: ¥{projected_revenue:,}")
-                    m2.metric("概算人件費 (現時点)", f"¥{int(total_labor_cost):,}", delta=f"着地予想: ¥{projected_labor_cost:,}", delta_color="inverse")
+                    m2.metric("概算人件費 (黒川さん除外)", f"¥{int(total_labor_cost):,}", delta=f"着地予想: ¥{projected_labor_cost:,}", delta_color="inverse")
                     m3.metric("システム費用", f"¥{current_sys_cost:,}")
                     m4.metric("推定粗利益 (現時点)", f"¥{int(current_profit):,}", delta=f"着地予想: ¥{projected_profit:,}")
 
