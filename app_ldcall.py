@@ -493,9 +493,17 @@ if spreadsheet_id:
             st.dataframe(df_lp_junmu, use_container_width=True)
 
             st.markdown("---")
-            st.subheader("👥 担当者別 集計表")
-            df_staff_summary = create_summary_table(df_t1, "担当者")
-            st.dataframe(df_staff_summary, use_container_width=True)
+            st.subheader("👥 担当者別 集計表（管理者専用）")
+            
+            # 🔒 管理者認証による閲覧制限
+            admin_pass_t1 = st.text_input("🔒 担当者別集計表の閲覧には管理者パスワードが必要です", type="password", key="t1_admin_pass")
+            if admin_pass_t1 == ADMIN_PASSWORD:
+                df_staff_summary = create_summary_table(df_t1, "担当者")
+                st.dataframe(df_staff_summary, use_container_width=True)
+            elif admin_pass_t1 != "":
+                st.error("パスワードが正しくありません")
+            else:
+                st.info("🔒 担当者別集計表を表示するには管理者パスワードを入力してください。")
 
         # ==========================================
         # TAB 2: 巡目・時間帯別分析
