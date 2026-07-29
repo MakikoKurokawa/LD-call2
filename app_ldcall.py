@@ -266,7 +266,6 @@ def save_system_cost(spreadsheet_id, month_str, cost_val):
         
     st.cache_data.clear()
 
-# 💡 月次収益記録の読み込み・保存処理
 @st.cache_data(ttl=60, show_spinner="月次収益記録を読み込み中...")
 def load_monthly_revenue_records(spreadsheet_id):
     try:
@@ -303,7 +302,6 @@ def save_monthly_revenue_records(spreadsheet_id, month_str, records_list):
         ws.append_row(["年月", "LP", "自動算出資料数", "自動算出売上", "承認後資料数", "承認後売上"])
         existing_values = [["年月", "LP", "自動算出資料数", "自動算出売上", "承認後資料数", "承認後売上"]]
 
-    # 該当月・LPのデータを更新または追加
     for r in records_list:
         lp_name = r["LP"]
         row_to_update = None
@@ -315,8 +313,11 @@ def save_monthly_revenue_records(spreadsheet_id, month_str, records_list):
         row_data = [month_str, lp_name, r["自動算出資料数"], r["自動算出売上"], r["承認後資料数"], r["承認後売上"]]
         if row_to_update:
             ws.update(f"A{row_to_update}:F{row_to_update}", [row_data])
+            # ローカル配列も更新して連続書き込み時の重複を防止
+            existing_values[row_to_update - 1] = row_data
         else:
             ws.append_row(row_data)
+            existing_values.append(row_data)
 
     st.cache_data.clear()
 
@@ -385,7 +386,8 @@ if spreadsheet_id:
             available_months, lp_list, all_staffs = [], ["全LP合計"], []
 
         # --- 5. 画面表示 ---
-        tab1, tab2, tab3 = st.tabs(["📊 全体パフォーマンス", "📈 巡目・時間帯別分析", "👤 個人レポート＆日報"])
+        # 💡 管理者用「売上管理」タブをスピンアウトし、独立した4つ目のタブとして配置
+        tab1, tab2, tab3, tab4 = st.tabs(["📊 全体パフォーマンス", "📈 巡目・時間帯別分析", "👤 個人レポート＆日報", "💰 売上管理"])
 
         # ==========================================
         # TAB 1: 全体パフォーマンス
@@ -431,159 +433,10 @@ if spreadsheet_id:
             df_lp_junmu = create_summary_table(df_t1, "巡目")
             st.dataframe(df_lp_junmu, use_container_width=True)
 
-            # 🔒 管理者専用エリア
             st.markdown("---")
-            with st.expander("🔒 【管理者専用】収益確認・着地予想 ＆ LP別確定売上記録"):
-                input_pass = st.text_input("管理者パスワードを入力してください", type="password", key="admin_pass")
-                if input_pass == ADMIN_PASSWORD:
-                    target_month_for_cost = sel_month if sel_month != "全期間" else (available_months[0] if available_months else "2026-07")
-                    
-                    current_sys_cost = 0
-                    if not df_system_costs.empty:
-                        m_cost = df_system_costs[df_system_costs["年月"] == target_month_for_cost]
-                        if not m_cost.empty:
-                            current_sys_cost = int(m_cost.iloc[0]["システム費用"])
-                            
-                    st.markdown(f"#### ⚙️ 【{target_month_for_cost}】 コスト・営業日数 設定")
-                    sc_col1, sc_col2 = st.columns(2)
-                    with sc_col1:
-                        input_sys_cost = st.number_input(f"【{target_month_for_cost}】のシステム費用（円）を入力", min_value=0, value=current_sys_cost, step=1000)
-                        if st.button("💾 システム費用を保存", key="btn_save_sys_cost"):
-                            try:
-                                save_system_cost(spreadsheet_id, target_month_for_cost, input_sys_cost)
-                                st.success(f"{target_month_for_cost}のシステム費用（¥{input_sys_cost:,}）を保存しました！")
-                                st.rerun()
-                            except Exception as sys_err:
-                                st.error(f"保存に失敗しました: {sys_err}")
-
-                    with sc_col2:
-                        adjust_b_days = st.number_input("営業日数 補正（日）※特別休業などはマイナス指定", value=0, step=1)
-
-                    # 16:00 締め切り基準の着地予想ロジック
-                    now_jst = datetime.now(JST)
-                    try:
-                        y_val, m_val = map(int, target_month_for_cost.split('-'))
-                    except Exception:
-                        y_val, m_val = now_jst.year, now_jst.month
-
-                    is_past_month = (y_val < now_jst.year) or (y_val == now_jst.year and m_val < now_jst.month)
-
-                    if is_past_month:
-                        _, last_d = calendar.monthrange(y_val, m_val)
-                        cutoff_date = date(y_val, m_val, last_d)
-                    else:
-                        if now_jst.hour < 16:
-                            cutoff_date = (now_jst - timedelta(days=1)).date()
-                        else:
-                            cutoff_date = now_jst.date()
-
-                    passed_days, total_b_days = get_business_days_info(y_val, m_val, cutoff_date, adjust_b_days)
-                    cutoff_date_str = cutoff_date.strftime('%Y-%m-%d')
-
-                    df_proj_t1 = df_t1[df_t1["日付"] <= cutoff_date_str] if not is_past_month else df_t1
-                    proj_docs = df_proj_t1["資料数"].sum() if not df_proj_t1.empty else 0
-                    proj_revenue = proj_docs * DOCUMENT_UNIT_PRICE
-
-                    if not df_work_hours.empty:
-                        df_wh_filtered = df_work_hours if is_past_month else df_work_hours[df_work_hours["日付"] <= cutoff_date_str]
-                        df_wh_cost_target = df_wh_filtered[~df_wh_filtered["担当者"].isin(['黒川', 'k', 'K'])]
-                        proj_labor_cost = int(df_wh_cost_target["稼働時間"].sum()) * MINUTE_WAGE
-                    else:
-                        proj_labor_cost = 0
-
-                    daily_avg_revenue = proj_revenue / passed_days
-                    daily_avg_labor_cost = proj_labor_cost / passed_days
-
-                    projected_revenue = int(daily_avg_revenue * total_b_days)
-                    projected_labor_cost = int(daily_avg_labor_cost * total_b_days)
-                    projected_profit = projected_revenue - (projected_labor_cost + current_sys_cost)
-
-                    total_revenue = total_docs * DOCUMENT_UNIT_PRICE
-                    if not df_work_hours.empty:
-                        total_mins_all = int(df_work_hours["稼働時間"].sum())
-                        df_wh_cost_all = df_work_hours[~df_work_hours["担当者"].isin(['黒川', 'k', 'K'])]
-                        total_labor_cost = int(df_wh_cost_all["稼働時間"].sum()) * MINUTE_WAGE
-                    else:
-                        total_mins_all = 0
-                        total_labor_cost = 0
-                        
-                    total_hours_all = round(total_mins_all / 60, 2)
-                    current_profit = total_revenue - (total_labor_cost + current_sys_cost)
-
-                    st.markdown("---")
-                    st.markdown(f"#### 📈 収益サマリー ＆ 月末着地予想（{target_month_for_cost}）")
-                    st.caption(f"⏰ 基準日: **{cutoff_date_str}** 時点（毎日 16:00 に更新）｜ 営業日数: **{passed_days} 日** / **{total_b_days} 日**（平均売上: **¥{int(daily_avg_revenue):,}** /日）")
-
-                    m1, m2, m3, m4 = st.columns(4)
-                    m1.metric("確定売上 (現時点)", f"¥{total_revenue:,}", delta=f"着地予想: ¥{projected_revenue:,}")
-                    m2.metric("概算人件費 (黒川さん除外)", f"¥{int(total_labor_cost):,}", delta=f"着地予想: ¥{projected_labor_cost:,}", delta_color="inverse")
-                    m3.metric("システム費用", f"¥{current_sys_cost:,}")
-                    m4.metric("推定粗利益 (現時点)", f"¥{int(current_profit):,}", delta=f"着地予想: ¥{projected_profit:,}")
-
-                    # 💡 LP別 承認後売上・資料数 手入力機能
-                    st.markdown("---")
-                    st.markdown(f"#### 📝 LP別 承認後確定データ入力（対象月: {target_month_for_cost}）")
-                    st.caption("※架電結果に基づく資料数・売上は自動入力されています。先方の承認後に確定した数値を右側の記入欄に入力し、保存してください。")
-
-                    df_target_m_lps = df_all[df_all["年月"] == target_month_for_cost]
-                    actual_lps = sorted([x for x in df_target_m_lps["LP"].unique() if x != "全LP合計"])
-
-                    input_records = []
-                    for idx, lp in enumerate(actual_lps):
-                        df_lp_data = df_target_m_lps[df_target_m_lps["LP"] == lp]
-                        auto_docs = int(df_lp_data["資料数"].sum())
-                        auto_rev = auto_docs * DOCUMENT_UNIT_PRICE
-
-                        # 既存の登録済みデータを初期値として取得
-                        init_app_docs = auto_docs
-                        init_app_rev = auto_rev
-                        if not df_revenue_records.empty:
-                            ex_row = df_revenue_records[(df_revenue_records["年月"] == target_month_for_cost) & (df_revenue_records["LP"] == lp)]
-                            if not ex_row.empty:
-                                init_app_docs = int(ex_row.iloc[0].get("承認後資料数", auto_docs))
-                                init_app_rev = int(ex_row.iloc[0].get("承認後売上", auto_rev))
-
-                        st.markdown(f"**📄 LP: {lp}**")
-                        r_col1, r_col2, r_col3, r_col4 = st.columns(4)
-                        r_col1.write(f"自動資料数: **{auto_docs} 件**")
-                        r_col2.write(f"自動売上: **¥{auto_rev:,}**")
-                        app_docs_val = r_col3.number_input("承認後 資料数(件)", min_value=0, value=init_app_docs, key=f"app_docs_{target_month_for_cost}_{lp}")
-                        app_rev_val = r_col4.number_input("承認後 売上(円)", min_value=0, value=init_app_rev, step=1000, key=f"app_rev_{target_month_for_cost}_{lp}")
-
-                        input_records.append({
-                            "LP": lp,
-                            "自動算出資料数": auto_docs,
-                            "自動算出売上": auto_rev,
-                            "承認後資料数": app_docs_val,
-                            "承認後売上": app_rev_val
-                        })
-
-                    if st.button(f"💾 【{target_month_for_cost}】の承認後確定データを保存", key="btn_save_monthly_rev"):
-                        try:
-                            save_monthly_revenue_records(spreadsheet_id, target_month_for_cost, input_records)
-                            st.success(f"{target_month_for_cost}の確定データをスプレッドシートに保存しました！")
-                            st.rerun()
-                        except Exception as rev_err:
-                            st.error(f"保存に失敗しました: {rev_err}")
-
-                    # 💡 蓄積された月次収益記録の一覧テーブル
-                    st.markdown("---")
-                    st.subheader("📚 月次収益記録 一覧（蓄積データ）")
-                    if not df_revenue_records.empty:
-                        # 読みやすいフォーマットで表示
-                        df_disp = df_revenue_records.copy()
-                        df_disp["自動算出売上"] = df_disp["自動算出売上"].apply(lambda x: f"¥{int(x):,}" if str(x).isdigit() else str(x))
-                        df_disp["承認後売上"] = df_disp["承認後売上"].apply(lambda x: f"¥{int(x):,}" if str(x).isdigit() else str(x))
-                        st.dataframe(df_disp, use_container_width=True)
-                    else:
-                        st.info("まだ保存された月次記録はありません。上記フォームから確定データを保存すると一覧に蓄積されます。")
-
-                    st.markdown("---")
-                    st.subheader("👥 担当者別 集計表")
-                    df_staff_summary = create_summary_table(df_t1, "担当者")
-                    st.dataframe(df_staff_summary, use_container_width=True)
-                elif input_pass != "":
-                    st.error("パスワードが正しくありません")
+            st.subheader("👥 担当者別 集計表")
+            df_staff_summary = create_summary_table(df_t1, "担当者")
+            st.dataframe(df_staff_summary, use_container_width=True)
 
         # ==========================================
         # TAB 2: 巡目・時間帯別分析
@@ -729,6 +582,166 @@ if spreadsheet_id:
 
                 elif input_user_pass != "":
                     st.error("パスワードが正しくありません。")
+
+        # ==========================================
+        # TAB 4: 💰 売上管理 (管理者専用タブ)
+        # ==========================================
+        with tab4:
+            st.subheader("🔒 管理者用 収益確認・着地予想 ＆ 月次承認売上管理")
+            input_pass = st.text_input("管理者パスワードを入力してください", type="password", key="admin_tab4_pass")
+            
+            if input_pass == ADMIN_PASSWORD:
+                # 💡 月選択フィルター（売上管理エリア専用）
+                target_month_for_cost = st.selectbox("📅 管理・記入対象の月を選択", available_months if available_months else ["2026-07"], index=0, key="tab4_target_month")
+                
+                # --- A. コスト・営業日数設定 ---
+                current_sys_cost = 0
+                if not df_system_costs.empty:
+                    m_cost = df_system_costs[df_system_costs["年月"] == target_month_for_cost]
+                    if not m_cost.empty:
+                        current_sys_cost = int(m_cost.iloc[0]["システム費用"])
+                        
+                st.markdown("---")
+                st.markdown(f"#### ⚙️ 【{target_month_for_cost}】 コスト・営業日数 設定")
+                sc_col1, sc_col2 = st.columns(2)
+                with sc_col1:
+                    input_sys_cost = st.number_input(f"【{target_month_for_cost}】のシステム費用（円）を入力", min_value=0, value=current_sys_cost, step=1000)
+                    if st.button("💾 システム費用を保存", key="btn_save_sys_cost_t4"):
+                        try:
+                            save_system_cost(spreadsheet_id, target_month_for_cost, input_sys_cost)
+                            st.success(f"{target_month_for_cost}のシステム費用（¥{input_sys_cost:,}）を保存しました！")
+                            st.rerun()
+                        except Exception as sys_err:
+                            st.error(f"保存に失敗しました: {sys_err}")
+
+                with sc_col2:
+                    adjust_b_days = st.number_input("営業日数 補正（日）※特別休業などはマイナス指定", value=0, step=1, key="tab4_adj_b_days")
+
+                # --- B. 16:00 締め切り基準の着地予想 ＆ 当月収益サマリー ---
+                now_jst = datetime.now(JST)
+                try:
+                    y_val, m_val = map(int, target_month_for_cost.split('-'))
+                except Exception:
+                    y_val, m_val = now_jst.year, now_jst.month
+
+                is_past_month = (y_val < now_jst.year) or (y_val == now_jst.year and m_val < now_jst.month)
+
+                if is_past_month:
+                    _, last_d = calendar.monthrange(y_val, m_val)
+                    cutoff_date = date(y_val, m_val, last_d)
+                else:
+                    if now_jst.hour < 16:
+                        cutoff_date = (now_jst - timedelta(days=1)).date()
+                    else:
+                        cutoff_date = now_jst.date()
+
+                passed_days, total_b_days = get_business_days_info(y_val, m_val, cutoff_date, adjust_b_days)
+                cutoff_date_str = cutoff_date.strftime('%Y-%m-%d')
+
+                # 対象月のデータ絞り込み
+                df_month_all = df_all[df_all["年月"] == target_month_for_cost]
+                total_m_docs = df_month_all["資料数"].sum() if not df_month_all.empty else 0
+                total_revenue = total_m_docs * DOCUMENT_UNIT_PRICE
+
+                df_proj_t1 = df_month_all[df_month_all["日付"] <= cutoff_date_str] if not is_past_month else df_month_all
+                proj_docs = df_proj_t1["資料数"].sum() if not df_proj_t1.empty else 0
+                proj_revenue = proj_docs * DOCUMENT_UNIT_PRICE
+
+                # 人件費計算（黒川さん除外）
+                if not df_work_hours.empty:
+                    # 対象月の日付範囲で絞り込み
+                    df_wh_m = df_work_hours[df_work_hours["日付"].str.startswith(target_month_for_cost)]
+                    df_wh_cost_all = df_wh_m[~df_wh_m["担当者"].isin(['黒川', 'k', 'K'])]
+                    total_labor_cost = int(df_wh_cost_all["稼働時間"].sum()) * MINUTE_WAGE
+
+                    df_wh_filtered = df_wh_m if is_past_month else df_wh_m[df_wh_m["日付"] <= cutoff_date_str]
+                    df_wh_cost_target = df_wh_filtered[~df_wh_filtered["担当者"].isin(['黒川', 'k', 'K'])]
+                    proj_labor_cost = int(df_wh_cost_target["稼働時間"].sum()) * MINUTE_WAGE
+                else:
+                    total_labor_cost = 0
+                    proj_labor_cost = 0
+
+                daily_avg_revenue = proj_revenue / passed_days
+                daily_avg_labor_cost = proj_labor_cost / passed_days
+
+                projected_revenue = int(daily_avg_revenue * total_b_days)
+                projected_labor_cost = int(daily_avg_labor_cost * total_b_days)
+                projected_profit = projected_revenue - (projected_labor_cost + current_sys_cost)
+
+                current_profit = total_revenue - (total_labor_cost + current_sys_cost)
+
+                st.markdown("---")
+                st.markdown(f"#### 📈 収益サマリー ＆ 月末着地予想（{target_month_for_cost}）")
+                st.caption(f"⏰ 基準日: **{cutoff_date_str}** 時点（16:00更新）｜ 営業日数: **{passed_days} 日** / **{total_b_days} 日**（平均売上: **¥{int(daily_avg_revenue):,}** /日）")
+
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("確定売上 (現時点)", f"¥{total_revenue:,}", delta=f"着地予想: ¥{projected_revenue:,}")
+                m2.metric("概算人件費 (黒川さん除外)", f"¥{int(total_labor_cost):,}", delta=f"着地予想: ¥{projected_labor_cost:,}", delta_color="inverse")
+                m3.metric("システム費用", f"¥{current_sys_cost:,}")
+                m4.metric("推定粗利益 (現時点)", f"¥{int(current_profit):,}", delta=f"着地予想: ¥{projected_profit:,}")
+
+                # --- C. LP別 承認後売上・資料数 手入力・更新フォーム ---
+                st.markdown("---")
+                st.markdown(f"#### 📝 LP別 承認後確定データ入力・修正（対象月: {target_month_for_cost}）")
+                st.caption("※対象月を選んで承認数値（確定後の資料数・売上）を入力してください。何度でも修正して再保存が可能です。")
+
+                actual_lps = sorted([x for x in df_month_all["LP"].unique() if x != "全LP合計"])
+
+                if actual_lps:
+                    input_records = []
+                    for idx, lp in enumerate(actual_lps):
+                        df_lp_data = df_month_all[df_month_all["LP"] == lp]
+                        auto_docs = int(df_lp_data["資料数"].sum())
+                        auto_rev = auto_docs * DOCUMENT_UNIT_PRICE
+
+                        # 保存済みのデータがあれば初期値としてロード
+                        init_app_docs = auto_docs
+                        init_app_rev = auto_rev
+                        if not df_revenue_records.empty:
+                            ex_row = df_revenue_records[(df_revenue_records["年月"] == target_month_for_cost) & (df_revenue_records["LP"] == lp)]
+                            if not ex_row.empty:
+                                init_app_docs = int(ex_row.iloc[0].get("承認後資料数", auto_docs))
+                                init_app_rev = int(ex_row.iloc[0].get("承認後売上", auto_rev))
+
+                        st.markdown(f"**📄 LP: {lp}**")
+                        r_col1, r_col2, r_col3, r_col4 = st.columns(4)
+                        r_col1.write(f"自動算出 資料数: **{auto_docs} 件**")
+                        r_col2.write(f"自動算出 売上: **¥{auto_rev:,}**")
+                        app_docs_val = r_col3.number_input("承認後 資料数(件)", min_value=0, value=init_app_docs, key=f"app_docs_{target_month_for_cost}_{lp}")
+                        app_rev_val = r_col4.number_input("承認後 売上(円)", min_value=0, value=init_app_rev, step=1000, key=f"app_rev_{target_month_for_cost}_{lp}")
+
+                        input_records.append({
+                            "LP": lp,
+                            "自動算出資料数": auto_docs,
+                            "自動算出売上": auto_rev,
+                            "承認後資料数": app_docs_val,
+                            "承認後売上": app_rev_val
+                        })
+
+                    if st.button(f"💾 【{target_month_for_cost}】の承認後確定データを保存", key="btn_save_monthly_rev_t4"):
+                        try:
+                            save_monthly_revenue_records(spreadsheet_id, target_month_for_cost, input_records)
+                            st.success(f"{target_month_for_cost}の確定データをスプレッドシートに保存しました！")
+                            st.rerun()
+                        except Exception as rev_err:
+                            st.error(f"保存に失敗しました: {rev_err}")
+                else:
+                    st.info(f"【{target_month_for_cost}】の架電成果データが見つかりません。")
+
+                # --- D. 蓄積された月次収益記録の一覧テーブル ---
+                st.markdown("---")
+                st.subheader("📚 月次収益記録 一覧（過去蓄積データ）")
+                if not df_revenue_records.empty:
+                    df_disp = df_revenue_records.copy()
+                    # 表示を見やすくフォーマット
+                    df_disp["自動算出売上"] = df_disp["自動算出売上"].apply(lambda x: f"¥{int(x):,}" if str(x).replace('-','').isdigit() else str(x))
+                    df_disp["承認後売上"] = df_disp["承認後売上"].apply(lambda x: f"¥{int(x):,}" if str(x).replace('-','').isdigit() else str(x))
+                    st.dataframe(df_disp, use_container_width=True)
+                else:
+                    st.info("まだ保存された月次記録はありません。上記フォームから確定データを保存すると一覧に蓄積されます。")
+
+            elif input_pass != "":
+                st.error("パスワードが正しくありません")
 
     except Exception as e:
         st.error(f"スプレッドシートの読み込み・処理に失敗しました: {e}")
