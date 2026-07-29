@@ -2,7 +2,8 @@ import streamlit as st
 import pandas as pd
 import re
 import gspread
-from datetime import datetime, timezone, timedelta
+import calendar
+from datetime import datetime, date, timezone, timedelta
 from google.oauth2.service_account import Credentials
 
 # ページ基本設定
@@ -21,6 +22,47 @@ ADMIN_PASSWORD = USER_PASSWORDS.get("admin", "admin123")
 REGISTERED_MEMBERS = [k for k in USER_PASSWORDS.keys() if k.lower() != "admin"]
 
 st.title("📞 社内コルセンダッシュボード")
+
+# --- 営業日数計算用の補助関数 (土日＋簡易日本の祝日判定) ---
+def get_business_days_info(year, month, today_date, adjust_days=0):
+    # 月の全日付を取得
+    _, last_day = calendar.monthrange(year, month)
+    
+    # 固定祝日・簡易判定（ハッピーマンデー等含む一般的な祝日リスト）
+    # ※厳密な祝日算出のため簡易ロジックを実装
+    def is_holiday(d):
+        if d.weekday() >= 5: # 土日
+            return True
+        # 固定祝日
+        m, day = d.month, d.day
+        fixed_holidays = [
+            (1,1), (1,2), (1,3), (2,11), (2,23), (4,29), (5,3), (5,4), (5,5),
+            (8,11), (11,3), (11,23), (12,23), (12,30), (12,31)
+        ]
+        if (m, day) in fixed_holidays:
+            return True
+        # 成人の日(1月第2月曜), 海の日(7月第3月曜), 敬老の日(9月第3月曜), 体育/スポーツの日(10月第2月曜)
+        if m == 1 and d.weekday() == 0 and 8 <= day <= 14: return True
+        if m == 7 and d.weekday() == 0 and 15 <= day <= 21: return True
+        if m == 9 and d.weekday() == 0 and 15 <= day <= 21: return True
+        if m == 10 and d.weekday() == 0 and 8 <= day <= 14: return True
+        return False
+
+    total_b_days = 0
+    passed_b_days = 0
+
+    for day_num in range(1, last_day + 1):
+        cur_d = date(year, month, day_num)
+        if not is_holiday(cur_d):
+            total_b_days += 1
+            if cur_d <= today_date:
+                passed_b_days += 1
+
+    # 手動補正を加味（0日割り算防止のため最小1日）
+    final_total_b_days = max(1, total_b_days + adjust_days)
+    final_passed_b_days = max(1, min(passed_b_days, final_total_b_days))
+    
+    return final_passed_b_days, final_total_b_days
 
 # --- 日付パース用の補助関数 ---
 def parse_custom_date(date_str):
@@ -102,7 +144,6 @@ def load_and_process_all_data(spreadsheet_id):
                 if not date_val or not res_val or res_val == "結果" or not staff_name:
                     continue
 
-                # 💡 k/K を「黒川」に読み替える処理
                 if staff_name.lower() == 'k':
                     staff_name = "黒川"
 
@@ -158,7 +199,6 @@ def load_work_hours(spreadsheet_id):
         if not df_wh.empty and "日付" in df_wh.columns and "担当者" in df_wh.columns and "稼働時間" in df_wh.columns:
             df_wh["日付"] = df_wh["日付"].astype(str)
             df_wh["担当者"] = df_wh["担当者"].astype(str)
-            # 💡 稼働時間シート内の k/K も「黒川」に統一
             df_wh["担当者"] = df_wh["担当者"].apply(lambda x: "黒川" if str(x).lower() == 'k' else x)
             df_wh["稼働時間"] = pd.to_numeric(df_wh["稼働時間"], errors='coerce').fillna(0).astype(int)
             return df_wh
@@ -344,7 +384,7 @@ if spreadsheet_id:
 
             # 🔒 管理者専用エリア
             st.markdown("---")
-            with st.expander("🔒 【管理者専用】収益確認 ＆ コスト管理"):
+            with st.expander("🔒 【管理者専用】収益確認 ＆ コスト・着地予想"):
                 input_pass = st.text_input("管理者パスワードを入力してください", type="password", key="admin_pass")
                 if input_pass == ADMIN_PASSWORD:
                     target_month_for_cost = sel_month if sel_month != "全期間" else (available_months[0] if available_months else "2026-07")
@@ -355,13 +395,10 @@ if spreadsheet_id:
                         if not m_cost.empty:
                             current_sys_cost = int(m_cost.iloc[0]["システム費用"])
                             
-                    st.markdown(f"#### ⚙️ 【{target_month_for_cost}】 システム費用 設定")
-                    sc_col1, sc_col2 = st.columns([2, 1])
+                    st.markdown(f"#### ⚙️ 【{target_month_for_cost}】 コスト・営業日数 設定")
+                    sc_col1, sc_col2 = st.columns(2)
                     with sc_col1:
                         input_sys_cost = st.number_input(f"【{target_month_for_cost}】のシステム費用（円）を入力", min_value=0, value=current_sys_cost, step=1000)
-                    with sc_col2:
-                        st.write("")
-                        st.write("")
                         if st.button("💾 システム費用を保存", key="btn_save_sys_cost"):
                             try:
                                 save_system_cost(spreadsheet_id, target_month_for_cost, input_sys_cost)
@@ -370,10 +407,29 @@ if spreadsheet_id:
                             except Exception as sys_err:
                                 st.error(f"保存に失敗しました: {sys_err}")
 
+                    with sc_col2:
+                        adjust_b_days = st.number_input("営業日数 補正（日）※特別休業などはマイナス指定", value=0, step=1, help="例: 年末年始などで平日を2日休業にする場合は「-2」と指定")
+
+                    # 💡 着地予想の計算処理
+                    now_jst = datetime.now(JST)
+                    try:
+                        y_val, m_val = map(int, target_month_for_cost.split('-'))
+                    except Exception:
+                        y_val, m_val = now_jst.year, now_jst.month
+
+                    # 過去月の場合は月最終日、当月の場合は今日の日付を基準にする
+                    if (y_val < now_jst.year) or (y_val == now_jst.year and m_val < now_jst.month):
+                        _, last_d = calendar.monthrange(y_val, m_val)
+                        ref_date = date(y_val, m_val, last_d)
+                    else:
+                        ref_date = now_jst.date()
+
+                    passed_days, total_b_days = get_business_days_info(y_val, m_val, ref_date, adjust_b_days)
+
                     st.markdown("---")
-                    st.markdown("#### 💰 収益サマリー")
+                    st.markdown(f"#### 📈 収益サマリー ＆ 月末着地予想（{target_month_for_cost}）")
                     
-                    # 稼働時間＆人件費計算（黒川さんを除外して計算）
+                    # 稼働時間＆人件費計算（黒川さん除外）
                     if not df_work_hours.empty:
                         total_mins_all = int(df_work_hours["稼働時間"].sum())
                         df_wh_cost_target = df_work_hours[~df_work_hours["担当者"].isin(['黒川', 'k', 'K'])]
@@ -386,14 +442,24 @@ if spreadsheet_id:
                     total_labor_cost = total_mins_cost_target * MINUTE_WAGE
                     total_revenue = total_docs * DOCUMENT_UNIT_PRICE
                     
-                    profit = total_revenue - (total_labor_cost + current_sys_cost)
+                    # 現在時点の粗利益
+                    current_profit = total_revenue - (total_labor_cost + current_sys_cost)
 
-                    m1, m2, m3, m4, m5 = st.columns(5)
-                    m1.metric("確定売上 (資料数×4,500円)", f"¥{total_revenue:,}")
-                    m2.metric("総稼働時間 (全員分)", f"{total_mins_all:,}分 ({total_hours_all}h)")
-                    m3.metric("概算人件費 (黒川さん除外)", f"¥{int(total_labor_cost):,}")
-                    m4.metric("システム費用", f"¥{current_sys_cost:,}")
-                    m5.metric("推定粗利益", f"¥{int(profit):,}")
+                    # --- 着地予想計算 ---
+                    daily_avg_revenue = total_revenue / passed_days
+                    daily_avg_labor_cost = total_labor_cost / passed_days
+                    
+                    projected_revenue = int(daily_avg_revenue * total_b_days)
+                    projected_labor_cost = int(daily_avg_labor_cost * total_b_days)
+                    projected_profit = projected_revenue - (projected_labor_cost + current_sys_cost)
+
+                    st.caption(f"🗓 営業日数: **{passed_days} 日** 消化 / **{total_b_days} 日** 中 （デイリー平均売上: **¥{int(daily_avg_revenue):,}** /日）")
+
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("確定売上 (現時点)", f"¥{total_revenue:,}", delta=f"着地予想: ¥{projected_revenue:,}")
+                    m2.metric("概算人件費 (現時点)", f"¥{int(total_labor_cost):,}", delta=f"着地予想: ¥{projected_labor_cost:,}", delta_color="inverse")
+                    m3.metric("システム費用", f"¥{current_sys_cost:,}")
+                    m4.metric("推定粗利益 (現時点)", f"¥{int(current_profit):,}", delta=f"着地予想: ¥{projected_profit:,}")
 
                     st.markdown("---")
                     st.subheader("👥 担当者別 集計表")
@@ -450,7 +516,6 @@ if spreadsheet_id:
                 st.info(f"🔒 **{selected_staff}** さんのパスワードを入力してください。")
                 input_user_pass = st.text_input(f"{selected_staff} さんのパスワード", type="password", key=f"pass_{selected_staff}")
                 
-                # secrets.tomlで「黒川」あるいは「k」どちらのキーで設定されていても対応可能に
                 correct_pass = USER_PASSWORDS.get(selected_staff, USER_PASSWORDS.get("k", ""))
                 
                 if input_user_pass != "" and (input_user_pass == correct_pass or input_user_pass == ADMIN_PASSWORD):
@@ -477,10 +542,10 @@ if spreadsheet_id:
                         if st.button("✅ 稼働時間を確定・提出する", key=f"btn_confirm_{selected_staff}"):
                             try:
                                 save_work_hour(spreadsheet_id, today_str, selected_staff, input_mins)
-                                st.success(f"保存完了！{selected_staff} さんの本日({today_str})の稼働時間（{input_mins}分）を提出しました。")
+                                st.success(f"スプレッドシートに保存完了！{selected_staff} さんの本日({today_str})の稼働時間（{input_mins}分）を提出しました。")
                                 st.rerun()
                             except Exception as save_err:
-                                st.error(f"保存に失敗しました: {save_err}")
+                                st.error(f"スプレッドシートへの保存に失敗しました: {save_err}")
 
                     # --- B. 当日（本日）の全LP合計 成績表示 ---
                     df_person_today = df_all[(df_all["担当者"] == selected_staff) & (df_all["日付"] == today_str)]
