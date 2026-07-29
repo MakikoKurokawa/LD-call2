@@ -23,7 +23,7 @@ REGISTERED_MEMBERS = [k for k in USER_PASSWORDS.keys() if k.lower() != "admin"]
 
 st.title("📞 社内コルセンダッシュボード")
 
-# --- 営業日数計算用の補助関数 (土日＋簡易日本の祝日判定) ---
+# --- 営業日数計算用の補助関数 ---
 def get_business_days_info(year, month, target_cutoff_date, adjust_days=0):
     _, last_day = calendar.monthrange(year, month)
     
@@ -102,7 +102,7 @@ def load_and_process_all_data(spreadsheet_id):
 
     for ws in worksheets:
         lp_name = ws.title
-        if lp_name in ["稼働時間", "システム費用"]:
+        if lp_name in ["稼働時間", "システム費用", "月次収益記録"]:
             continue
             
         raw_values = ws.get_all_values()
@@ -181,7 +181,7 @@ def load_and_process_all_data(spreadsheet_id):
                 
     return pd.DataFrame(all_records)
 
-# --- 3. 稼働時間＆システム費用の読み込み・書き込み関数 ---
+# --- 3. データ入出力関数群 ---
 @st.cache_data(ttl=60, show_spinner="稼働時間データを読み込み中...")
 def load_work_hours(spreadsheet_id):
     try:
@@ -266,6 +266,60 @@ def save_system_cost(spreadsheet_id, month_str, cost_val):
         
     st.cache_data.clear()
 
+# 💡 月次収益記録の読み込み・保存処理
+@st.cache_data(ttl=60, show_spinner="月次収益記録を読み込み中...")
+def load_monthly_revenue_records(spreadsheet_id):
+    try:
+        client = get_gspread_client()
+        sh = client.open_by_key(spreadsheet_id)
+        try:
+            ws = sh.worksheet("月次収益記録")
+        except Exception:
+            ws = sh.add_worksheet(title="月次収益記録", rows="500", cols="6")
+            ws.append_row(["年月", "LP", "自動算出資料数", "自動算出売上", "承認後資料数", "承認後売上"])
+            return pd.DataFrame(columns=["年月", "LP", "自動算出資料数", "自動算出売上", "承認後資料数", "承認後売上"])
+
+        records = ws.get_all_records()
+        df_rec = pd.DataFrame(records)
+        if not df_rec.empty:
+            df_rec["年月"] = df_rec["年月"].astype(str)
+            df_rec["LP"] = df_rec["LP"].astype(str)
+            return df_rec
+    except Exception:
+        pass
+    return pd.DataFrame(columns=["年月", "LP", "自動算出資料数", "自動算出売上", "承認後資料数", "承認後売上"])
+
+def save_monthly_revenue_records(spreadsheet_id, month_str, records_list):
+    client = get_gspread_client()
+    sh = client.open_by_key(spreadsheet_id)
+    try:
+        ws = sh.worksheet("月次収益記録")
+    except Exception:
+        ws = sh.add_worksheet(title="月次収益記録", rows="500", cols="6")
+        ws.append_row(["年月", "LP", "自動算出資料数", "自動算出売上", "承認後資料数", "承認後売上"])
+
+    existing_values = ws.get_all_values()
+    if not existing_values:
+        ws.append_row(["年月", "LP", "自動算出資料数", "自動算出売上", "承認後資料数", "承認後売上"])
+        existing_values = [["年月", "LP", "自動算出資料数", "自動算出売上", "承認後資料数", "承認後売上"]]
+
+    # 該当月・LPのデータを更新または追加
+    for r in records_list:
+        lp_name = r["LP"]
+        row_to_update = None
+        for idx, row in enumerate(existing_values[1:], start=2):
+            if len(row) >= 2 and row[0] == month_str and row[1] == lp_name:
+                row_to_update = idx
+                break
+
+        row_data = [month_str, lp_name, r["自動算出資料数"], r["自動算出売上"], r["承認後資料数"], r["承認後売上"]]
+        if row_to_update:
+            ws.update(f"A{row_to_update}:F{row_to_update}", [row_data])
+        else:
+            ws.append_row(row_data)
+
+    st.cache_data.clear()
+
 # --- 集計テーブル作成ヘルパー関数 ---
 def create_summary_table(df, group_col, raw_mode=False):
     if df.empty:
@@ -313,6 +367,7 @@ if spreadsheet_id:
         df_all = load_and_process_all_data(spreadsheet_id)
         df_work_hours = load_work_hours(spreadsheet_id)
         df_system_costs = load_system_costs(spreadsheet_id)
+        df_revenue_records = load_monthly_revenue_records(spreadsheet_id)
 
         if not df_all.empty:
             available_months = sorted([m for m in df_all["年月"].unique() if m != "不明"], reverse=True)
@@ -378,7 +433,7 @@ if spreadsheet_id:
 
             # 🔒 管理者専用エリア
             st.markdown("---")
-            with st.expander("🔒 【管理者専用】収益確認 ＆ コスト・着地予想"):
+            with st.expander("🔒 【管理者専用】収益確認・着地予想 ＆ LP別確定売上記録"):
                 input_pass = st.text_input("管理者パスワードを入力してください", type="password", key="admin_pass")
                 if input_pass == ADMIN_PASSWORD:
                     target_month_for_cost = sel_month if sel_month != "全期間" else (available_months[0] if available_months else "2026-07")
@@ -402,23 +457,21 @@ if spreadsheet_id:
                                 st.error(f"保存に失敗しました: {sys_err}")
 
                     with sc_col2:
-                        adjust_b_days = st.number_input("営業日数 補正（日）※特別休業などはマイナス指定", value=0, step=1, help="例: 年末年始などで平日を2日休業にする場合は「-2」と指定")
+                        adjust_b_days = st.number_input("営業日数 補正（日）※特別休業などはマイナス指定", value=0, step=1)
 
-                    # 💡 16:00 締め切り基準の着地予想ロジック
+                    # 16:00 締め切り基準の着地予想ロジック
                     now_jst = datetime.now(JST)
                     try:
                         y_val, m_val = map(int, target_month_for_cost.split('-'))
                     except Exception:
                         y_val, m_val = now_jst.year, now_jst.month
 
-                    # 過去月か当月かの判定
                     is_past_month = (y_val < now_jst.year) or (y_val == now_jst.year and m_val < now_jst.month)
 
                     if is_past_month:
                         _, last_d = calendar.monthrange(y_val, m_val)
                         cutoff_date = date(y_val, m_val, last_d)
                     else:
-                        # 当月の場合: 16時前なら前日、16時以降なら本日を基準日とする
                         if now_jst.hour < 16:
                             cutoff_date = (now_jst - timedelta(days=1)).date()
                         else:
@@ -427,12 +480,10 @@ if spreadsheet_id:
                     passed_days, total_b_days = get_business_days_info(y_val, m_val, cutoff_date, adjust_b_days)
                     cutoff_date_str = cutoff_date.strftime('%Y-%m-%d')
 
-                    # 着地計算用のデータフィルタリング（16時前なら前日分までのデータのみ抽出）
                     df_proj_t1 = df_t1[df_t1["日付"] <= cutoff_date_str] if not is_past_month else df_t1
                     proj_docs = df_proj_t1["資料数"].sum() if not df_proj_t1.empty else 0
                     proj_revenue = proj_docs * DOCUMENT_UNIT_PRICE
 
-                    # 人件費計算（16時前なら前日分までの稼働時間のみ抽出）
                     if not df_work_hours.empty:
                         df_wh_filtered = df_work_hours if is_past_month else df_work_hours[df_work_hours["日付"] <= cutoff_date_str]
                         df_wh_cost_target = df_wh_filtered[~df_wh_filtered["担当者"].isin(['黒川', 'k', 'K'])]
@@ -440,16 +491,13 @@ if spreadsheet_id:
                     else:
                         proj_labor_cost = 0
 
-                    # 経過日数時点の実効デイリー平均
                     daily_avg_revenue = proj_revenue / passed_days
                     daily_avg_labor_cost = proj_labor_cost / passed_days
 
-                    # 月末着地数値
                     projected_revenue = int(daily_avg_revenue * total_b_days)
                     projected_labor_cost = int(daily_avg_labor_cost * total_b_days)
                     projected_profit = projected_revenue - (projected_labor_cost + current_sys_cost)
 
-                    # 全体実績（確定値）
                     total_revenue = total_docs * DOCUMENT_UNIT_PRICE
                     if not df_work_hours.empty:
                         total_mins_all = int(df_work_hours["稼働時間"].sum())
@@ -464,13 +512,71 @@ if spreadsheet_id:
 
                     st.markdown("---")
                     st.markdown(f"#### 📈 収益サマリー ＆ 月末着地予想（{target_month_for_cost}）")
-                    st.caption(f"⏰ 基準日: **{cutoff_date_str}** 時点（毎日 16:00 に当日分へ更新）｜ 営業日数: **{passed_days} 日** 消化 / **{total_b_days} 日** 中（平均売上: **¥{int(daily_avg_revenue):,}** /日）")
+                    st.caption(f"⏰ 基準日: **{cutoff_date_str}** 時点（毎日 16:00 に更新）｜ 営業日数: **{passed_days} 日** / **{total_b_days} 日**（平均売上: **¥{int(daily_avg_revenue):,}** /日）")
 
                     m1, m2, m3, m4 = st.columns(4)
                     m1.metric("確定売上 (現時点)", f"¥{total_revenue:,}", delta=f"着地予想: ¥{projected_revenue:,}")
                     m2.metric("概算人件費 (黒川さん除外)", f"¥{int(total_labor_cost):,}", delta=f"着地予想: ¥{projected_labor_cost:,}", delta_color="inverse")
                     m3.metric("システム費用", f"¥{current_sys_cost:,}")
                     m4.metric("推定粗利益 (現時点)", f"¥{int(current_profit):,}", delta=f"着地予想: ¥{projected_profit:,}")
+
+                    # 💡 LP別 承認後売上・資料数 手入力機能
+                    st.markdown("---")
+                    st.markdown(f"#### 📝 LP別 承認後確定データ入力（対象月: {target_month_for_cost}）")
+                    st.caption("※架電結果に基づく資料数・売上は自動入力されています。先方の承認後に確定した数値を右側の記入欄に入力し、保存してください。")
+
+                    df_target_m_lps = df_all[df_all["年月"] == target_month_for_cost]
+                    actual_lps = sorted([x for x in df_target_m_lps["LP"].unique() if x != "全LP合計"])
+
+                    input_records = []
+                    for idx, lp in enumerate(actual_lps):
+                        df_lp_data = df_target_m_lps[df_target_m_lps["LP"] == lp]
+                        auto_docs = int(df_lp_data["資料数"].sum())
+                        auto_rev = auto_docs * DOCUMENT_UNIT_PRICE
+
+                        # 既存の登録済みデータを初期値として取得
+                        init_app_docs = auto_docs
+                        init_app_rev = auto_rev
+                        if not df_revenue_records.empty:
+                            ex_row = df_revenue_records[(df_revenue_records["年月"] == target_month_for_cost) & (df_revenue_records["LP"] == lp)]
+                            if not ex_row.empty:
+                                init_app_docs = int(ex_row.iloc[0].get("承認後資料数", auto_docs))
+                                init_app_rev = int(ex_row.iloc[0].get("承認後売上", auto_rev))
+
+                        st.markdown(f"**📄 LP: {lp}**")
+                        r_col1, r_col2, r_col3, r_col4 = st.columns(4)
+                        r_col1.write(f"自動資料数: **{auto_docs} 件**")
+                        r_col2.write(f"自動売上: **¥{auto_rev:,}**")
+                        app_docs_val = r_col3.number_input("承認後 資料数(件)", min_value=0, value=init_app_docs, key=f"app_docs_{target_month_for_cost}_{lp}")
+                        app_rev_val = r_col4.number_input("承認後 売上(円)", min_value=0, value=init_app_rev, step=1000, key=f"app_rev_{target_month_for_cost}_{lp}")
+
+                        input_records.append({
+                            "LP": lp,
+                            "自動算出資料数": auto_docs,
+                            "自動算出売上": auto_rev,
+                            "承認後資料数": app_docs_val,
+                            "承認後売上": app_rev_val
+                        })
+
+                    if st.button(f"💾 【{target_month_for_cost}】の承認後確定データを保存", key="btn_save_monthly_rev"):
+                        try:
+                            save_monthly_revenue_records(spreadsheet_id, target_month_for_cost, input_records)
+                            st.success(f"{target_month_for_cost}の確定データをスプレッドシートに保存しました！")
+                            st.rerun()
+                        except Exception as rev_err:
+                            st.error(f"保存に失敗しました: {rev_err}")
+
+                    # 💡 蓄積された月次収益記録の一覧テーブル
+                    st.markdown("---")
+                    st.subheader("📚 月次収益記録 一覧（蓄積データ）")
+                    if not df_revenue_records.empty:
+                        # 読みやすいフォーマットで表示
+                        df_disp = df_revenue_records.copy()
+                        df_disp["自動算出売上"] = df_disp["自動算出売上"].apply(lambda x: f"¥{int(x):,}" if str(x).isdigit() else str(x))
+                        df_disp["承認後売上"] = df_disp["承認後売上"].apply(lambda x: f"¥{int(x):,}" if str(x).isdigit() else str(x))
+                        st.dataframe(df_disp, use_container_width=True)
+                    else:
+                        st.info("まだ保存された月次記録はありません。上記フォームから確定データを保存すると一覧に蓄積されます。")
 
                     st.markdown("---")
                     st.subheader("👥 担当者別 集計表")
