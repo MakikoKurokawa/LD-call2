@@ -12,8 +12,11 @@ st.set_page_config(page_title="社内コルセンダッシュボード", layout=
 # --- 1. 定数設定 ---
 HOURLY_WAGE = 2000              # 時給2,000円
 MINUTE_WAGE = HOURLY_WAGE / 60  # 分単価
-DOCUMENT_UNIT_PRICE = 4500      # 資料1件あたりの売上単価 (4,500円)
 JST = timezone(timedelta(hours=9)) # 日本時間(JST)の設定
+
+# 承認率90%・オープンハウス20%混ざりを考慮した実効想定単価
+UNIT_PRICE_SINGLE_TL_EST = 4050  # (5,000*0.8 + 2,500*0.2) * 0.9 = 4,050円
+UNIT_PRICE_GODOU_EST = 4410      # (5,500*0.8 + 2,500*0.2) * 0.9 = 4,410円
 
 USER_PASSWORDS = st.secrets.get("passwords", {"admin": "admin123"})
 ADMIN_PASSWORD = USER_PASSWORDS.get("admin", "admin123")
@@ -77,6 +80,51 @@ def parse_custom_date(date_str):
         except ValueError:
             return None, "不明"
     return None, "不明"
+
+# --- LP分類＆想定売上計算ヘルパー関数（承認率90%・OH20%考慮） ---
+def classify_lp_and_calc_revenue(df_month):
+    counts = {
+        "単独LP": 0,
+        "合同LP3": 0,
+        "合同LP4": 0,
+        "不動産合同": 0,
+        "TLデッド": 0,
+        "その他": 0
+    }
+    
+    if df_month.empty:
+        return counts, 0, 0
+
+    for _, row in df_month.iterrows():
+        lp = str(row.get("LP", "")).strip()
+        docs = int(row.get("資料数", 0))
+        
+        if "TLデッド" in lp or "TL" in lp:
+            counts["TLデッド"] += docs
+        elif "合同3" in lp or ("3" in lp and "合同" in lp):
+            counts["合同LP3"] += docs
+        elif "合同4" in lp or ("4" in lp and "合同" in lp):
+            counts["合同LP4"] += docs
+        elif "不動産合同" in lp or "不動産" in lp:
+            counts["不動産合同"] += docs
+        elif "合同" in lp:
+            counts["合同LP3"] += docs
+        elif "単独" in lp:
+            counts["単独LP"] += docs
+        else:
+            counts["単独LP"] += docs
+
+    total_docs = sum(counts.values())
+    
+    # 想定売上計算
+    # 単独/TLデッド: 送客1件あたり 4,050円 ((5000*0.8 + 2500*0.2) * 0.9)
+    # 合同/不動産合同: 送客1件あたり 4,410円 ((5500*0.8 + 2500*0.2) * 0.9)
+    est_rev = int(
+        (counts["単独LP"] + counts["TLデッド"]) * UNIT_PRICE_SINGLE_TL_EST +
+        (counts["合同LP3"] + counts["合同LP4"] + counts["不動産合同"] + counts["その他"]) * UNIT_PRICE_GODOU_EST
+    )
+    
+    return counts, total_docs, est_rev
 
 # --- GSpread認証クライアント取得関数 ---
 def get_gspread_client():
@@ -268,56 +316,68 @@ def save_system_cost(spreadsheet_id, month_str, cost_val):
 
 @st.cache_data(ttl=60, show_spinner="月次収益記録を読み込み中...")
 def load_monthly_revenue_records(spreadsheet_id):
+    cols = [
+        "年月", "送客_単独LP", "送客_合同LP3", "送客_合同LP4", "送客_不動産合同", "送客_TLデッド", "送客_合計", "想定売上",
+        "承認_単独TL", "承認_合同", "承認_オープンハウス", "承認_合計", "確定売上", "更新日時"
+    ]
     try:
         client = get_gspread_client()
         sh = client.open_by_key(spreadsheet_id)
         try:
             ws = sh.worksheet("月次収益記録")
         except Exception:
-            ws = sh.add_worksheet(title="月次収益記録", rows="500", cols="6")
-            ws.append_row(["年月", "LP", "自動算出資料数", "自動算出売上", "承認後資料数", "承認後売上"])
-            return pd.DataFrame(columns=["年月", "LP", "自動算出資料数", "自動算出売上", "承認後資料数", "承認後売上"])
+            ws = sh.add_worksheet(title="月次収益記録", rows="500", cols=len(cols))
+            ws.append_row(cols)
+            return pd.DataFrame(columns=cols)
 
         records = ws.get_all_records()
         df_rec = pd.DataFrame(records)
         if not df_rec.empty:
             df_rec["年月"] = df_rec["年月"].astype(str)
-            df_rec["LP"] = df_rec["LP"].astype(str)
             return df_rec
     except Exception:
         pass
-    return pd.DataFrame(columns=["年月", "LP", "自動算出資料数", "自動算出売上", "承認後資料数", "承認後売上"])
+    return pd.DataFrame(columns=cols)
 
-def save_monthly_revenue_records(spreadsheet_id, month_str, records_list):
+def save_monthly_revenue_detailed(spreadsheet_id, month_str, send_dict, est_rev, app_single, app_godou, app_oh, final_rev):
+    cols = [
+        "年月", "送客_単独LP", "送客_合同LP3", "送客_合同LP4", "送客_不動産合同", "送客_TLデッド", "送客_合計", "想定売上",
+        "承認_単独TL", "承認_合同", "承認_オープンハウス", "承認_合計", "確定売上", "更新日時"
+    ]
     client = get_gspread_client()
     sh = client.open_by_key(spreadsheet_id)
     try:
         ws = sh.worksheet("月次収益記録")
     except Exception:
-        ws = sh.add_worksheet(title="月次収益記録", rows="500", cols="6")
-        ws.append_row(["年月", "LP", "自動算出資料数", "自動算出売上", "承認後資料数", "承認後売上"])
+        ws = sh.add_worksheet(title="月次収益記録", rows="500", cols=len(cols))
+        ws.append_row(cols)
 
     existing_values = ws.get_all_values()
     if not existing_values:
-        ws.append_row(["年月", "LP", "自動算出資料数", "自動算出売上", "承認後資料数", "承認後売上"])
-        existing_values = [["年月", "LP", "自動算出資料数", "自動算出売上", "承認後資料数", "承認後売上"]]
+        ws.append_row(cols)
+        existing_values = [cols]
 
-    for r in records_list:
-        lp_name = r["LP"]
-        row_to_update = None
-        for idx, row in enumerate(existing_values[1:], start=2):
-            if len(row) >= 2 and row[0] == month_str and row[1] == lp_name:
-                row_to_update = idx
-                break
+    send_total = sum(send_dict.values())
+    app_total = app_single + app_godou + app_oh
+    now_time_str = datetime.now(JST).strftime('%Y-%m-%d %H:%M')
 
-        row_data = [month_str, lp_name, r["自動算出資料数"], r["自動算出売上"], r["承認後資料数"], r["承認後売上"]]
-        if row_to_update:
-            ws.update(f"A{row_to_update}:F{row_to_update}", [row_data])
-            # ローカル配列も更新して連続書き込み時の重複を防止
-            existing_values[row_to_update - 1] = row_data
-        else:
-            ws.append_row(row_data)
-            existing_values.append(row_data)
+    row_data = [
+        month_str,
+        send_dict.get("単独LP", 0), send_dict.get("合同LP3", 0), send_dict.get("合同LP4", 0),
+        send_dict.get("不動産合同", 0), send_dict.get("TLデッド", 0), send_total, est_rev,
+        app_single, app_godou, app_oh, app_total, final_rev, now_time_str
+    ]
+
+    row_to_update = None
+    for idx, row in enumerate(existing_values[1:], start=2):
+        if len(row) >= 1 and row[0] == month_str:
+            row_to_update = idx
+            break
+
+    if row_to_update:
+        ws.update(f"A{row_to_update}:N{row_to_update}", [row_data])
+    else:
+        ws.append_row(row_data)
 
     st.cache_data.clear()
 
@@ -386,7 +446,6 @@ if spreadsheet_id:
             available_months, lp_list, all_staffs = [], ["全LP合計"], []
 
         # --- 5. 画面表示 ---
-        # 💡 管理者用「売上管理」タブをスピンアウトし、独立した4つ目のタブとして配置
         tab1, tab2, tab3, tab4 = st.tabs(["📊 全体パフォーマンス", "📈 巡目・時間帯別分析", "👤 個人レポート＆日報", "💰 売上管理"])
 
         # ==========================================
@@ -591,7 +650,6 @@ if spreadsheet_id:
             input_pass = st.text_input("管理者パスワードを入力してください", type="password", key="admin_tab4_pass")
             
             if input_pass == ADMIN_PASSWORD:
-                # 💡 月選択フィルター（売上管理エリア専用）
                 target_month_for_cost = st.selectbox("📅 管理・記入対象の月を選択", available_months if available_months else ["2026-07"], index=0, key="tab4_target_month")
                 
                 # --- A. コスト・営業日数設定 ---
@@ -617,7 +675,7 @@ if spreadsheet_id:
                 with sc_col2:
                     adjust_b_days = st.number_input("営業日数 補正（日）※特別休業などはマイナス指定", value=0, step=1, key="tab4_adj_b_days")
 
-                # --- B. 16:00 締め切り基準の着地予想 ＆ 当月収益サマリー ---
+                # --- B. 着地予想 ＆ 当月収益サマリー ---
                 now_jst = datetime.now(JST)
                 try:
                     y_val, m_val = map(int, target_month_for_cost.split('-'))
@@ -638,18 +696,15 @@ if spreadsheet_id:
                 passed_days, total_b_days = get_business_days_info(y_val, m_val, cutoff_date, adjust_b_days)
                 cutoff_date_str = cutoff_date.strftime('%Y-%m-%d')
 
-                # 対象月のデータ絞り込み
                 df_month_all = df_all[df_all["年月"] == target_month_for_cost]
-                total_m_docs = df_month_all["資料数"].sum() if not df_month_all.empty else 0
-                total_revenue = total_m_docs * DOCUMENT_UNIT_PRICE
+                
+                # LP別自動分類と想定売上算出（承認率90%・OH20%考慮済みの想定売上）
+                send_counts, total_send_docs, est_total_revenue = classify_lp_and_calc_revenue(df_month_all)
 
                 df_proj_t1 = df_month_all[df_month_all["日付"] <= cutoff_date_str] if not is_past_month else df_month_all
-                proj_docs = df_proj_t1["資料数"].sum() if not df_proj_t1.empty else 0
-                proj_revenue = proj_docs * DOCUMENT_UNIT_PRICE
+                _, _, proj_revenue = classify_lp_and_calc_revenue(df_proj_t1)
 
-                # 人件費計算（黒川さん除外）
                 if not df_work_hours.empty:
-                    # 対象月の日付範囲で絞り込み
                     df_wh_m = df_work_hours[df_work_hours["日付"].str.startswith(target_month_for_cost)]
                     df_wh_cost_all = df_wh_m[~df_wh_m["担当者"].isin(['黒川', 'k', 'K'])]
                     total_labor_cost = int(df_wh_cost_all["稼働時間"].sum()) * MINUTE_WAGE
@@ -668,75 +723,119 @@ if spreadsheet_id:
                 projected_labor_cost = int(daily_avg_labor_cost * total_b_days)
                 projected_profit = projected_revenue - (projected_labor_cost + current_sys_cost)
 
-                current_profit = total_revenue - (total_labor_cost + current_sys_cost)
+                current_profit = est_total_revenue - (total_labor_cost + current_sys_cost)
 
                 st.markdown("---")
                 st.markdown(f"#### 📈 収益サマリー ＆ 月末着地予想（{target_month_for_cost}）")
-                st.caption(f"⏰ 基準日: **{cutoff_date_str}** 時点（16:00更新）｜ 営業日数: **{passed_days} 日** / **{total_b_days} 日**（平均売上: **¥{int(daily_avg_revenue):,}** /日）")
+                st.caption(f"⏰ 基準日: **{cutoff_date_str}** 時点（16:00更新）｜ 営業日数: **{passed_days} 日** / **{total_b_days} 日**（日別平均想定売上: **¥{int(daily_avg_revenue):,}**）")
+                st.caption("※想定売上は「承認率90%・オープンハウス構成比20%（単独4,050円/合同4,410円）」をあらかじめ加味した硬めの推計値です。")
 
                 m1, m2, m3, m4 = st.columns(4)
-                m1.metric("確定売上 (現時点)", f"¥{total_revenue:,}", delta=f"着地予想: ¥{projected_revenue:,}")
+                m1.metric("想定売上 (送客×90%承認単価)", f"¥{est_total_revenue:,}", delta=f"着地予想: ¥{projected_revenue:,}")
                 m2.metric("概算人件費 (黒川さん除外)", f"¥{int(total_labor_cost):,}", delta=f"着地予想: ¥{projected_labor_cost:,}", delta_color="inverse")
                 m3.metric("システム費用", f"¥{current_sys_cost:,}")
-                m4.metric("推定粗利益 (現時点)", f"¥{int(current_profit):,}", delta=f"着地予想: ¥{projected_profit:,}")
+                m4.metric("概算粗利益 (想定)", f"¥{int(current_profit):,}", delta=f"着地予想: ¥{projected_profit:,}")
 
-                # --- C. LP別 承認後売上・資料数 手入力・更新フォーム ---
+                # --- C. 承認後件数・確定売上 入力フォーム ---
                 st.markdown("---")
-                st.markdown(f"#### 📝 LP別 承認後確定データ入力・修正（対象月: {target_month_for_cost}）")
-                st.caption("※対象月を選んで承認数値（確定後の資料数・売上）を入力してください。何度でも修正して再保存が可能です。")
+                st.markdown(f"#### 📝 承認後件数・確定売上 入力（対象月: {target_month_for_cost}）")
+                
+                st.info(
+                    f"📊 **【{target_month_for_cost}】 送客数自動集計結果** ： "
+                    f"単独LP: **{send_counts['単独LP']}**件 ｜ 合同LP3: **{send_counts['合同LP3']}**件 ｜ 合同LP4: **{send_counts['合同LP4']}**件 ｜ "
+                    f"不動産合同: **{send_counts['不動産合同']}**件 ｜ TLデッド: **{send_counts['TLデッド']}**件 "
+                    f"👉 **合計: {total_send_docs}件** （承認率90%考慮の想定売上: **¥{est_total_revenue:,}**）"
+                )
 
-                actual_lps = sorted([x for x in df_month_all["LP"].unique() if x != "全LP合計"])
+                # 保存済みデータを初期値として呼び出し（承認数は送客数×0.9をデフォルト設定）
+                init_app_single = int((send_counts['単独LP'] + send_counts['TLデッド']) * 0.9)
+                init_app_godou = int((send_counts['合同LP3'] + send_counts['合同LP4'] + send_counts['不動産合同']) * 0.9)
+                init_app_oh = 0
+                init_final_rev = est_total_revenue
 
-                if actual_lps:
-                    input_records = []
-                    for idx, lp in enumerate(actual_lps):
-                        df_lp_data = df_month_all[df_month_all["LP"] == lp]
-                        auto_docs = int(df_lp_data["資料数"].sum())
-                        auto_rev = auto_docs * DOCUMENT_UNIT_PRICE
+                if not df_revenue_records.empty:
+                    ex_row = df_revenue_records[df_revenue_records["年月"] == target_month_for_cost]
+                    if not ex_row.empty:
+                        init_app_single = int(ex_row.iloc[0].get("承認_単独TL", init_app_single))
+                        init_app_godou = int(ex_row.iloc[0].get("承認_合同", init_app_godou))
+                        init_app_oh = int(ex_row.iloc[0].get("承認_オープンハウス", 0))
+                        init_final_rev = int(ex_row.iloc[0].get("確定売上", est_total_revenue))
 
-                        # 保存済みのデータがあれば初期値としてロード
-                        init_app_docs = auto_docs
-                        init_app_rev = auto_rev
-                        if not df_revenue_records.empty:
-                            ex_row = df_revenue_records[(df_revenue_records["年月"] == target_month_for_cost) & (df_revenue_records["LP"] == lp)]
-                            if not ex_row.empty:
-                                init_app_docs = int(ex_row.iloc[0].get("承認後資料数", auto_docs))
-                                init_app_rev = int(ex_row.iloc[0].get("承認後売上", auto_rev))
+                st.write("##### 1. 承認後件数の入力")
+                c_app1, c_app2, c_app3 = st.columns(3)
+                with c_app1:
+                    in_app_single = st.number_input("承認件数：単独LP・TLデッド (5,000円/件)", min_value=0, value=init_app_single, key="in_app_single")
+                with c_app2:
+                    in_app_godou = st.number_input("承認件数：合同LP (5,500円/件)", min_value=0, value=init_app_godou, key="in_app_godou")
+                with c_app3:
+                    in_app_oh = st.number_input("承認件数：オープンハウス (2,500円/件)", min_value=0, value=init_app_oh, key="in_app_oh")
 
-                        st.markdown(f"**📄 LP: {lp}**")
-                        r_col1, r_col2, r_col3, r_col4 = st.columns(4)
-                        r_col1.write(f"自動算出 資料数: **{auto_docs} 件**")
-                        r_col2.write(f"自動算出 売上: **¥{auto_rev:,}**")
-                        app_docs_val = r_col3.number_input("承認後 資料数(件)", min_value=0, value=init_app_docs, key=f"app_docs_{target_month_for_cost}_{lp}")
-                        app_rev_val = r_col4.number_input("承認後 売上(円)", min_value=0, value=init_app_rev, step=1000, key=f"app_rev_{target_month_for_cost}_{lp}")
+                # 単価連動の確定売上自動推計（入力した確定数×定価単価）
+                auto_calc_rev = (in_app_single * 5000) + (in_app_godou * 5500) + (in_app_oh * 2500)
+                
+                st.write("##### 2. 確定売上の調整・確定")
+                st.caption("※入力した承認件数に基づく確定売上（定価計算）が表示されています。振込額や調整額がある場合は数値を書き換えてください。")
+                in_final_rev = st.number_input("確定売上（合計金額 / 円）", min_value=0, value=auto_calc_rev if init_final_rev == est_total_revenue else init_final_rev, step=1000, key="in_final_rev")
 
-                        input_records.append({
-                            "LP": lp,
-                            "自動算出資料数": auto_docs,
-                            "自動算出売上": auto_rev,
-                            "承認後資料数": app_docs_val,
-                            "承認後売上": app_rev_val
-                        })
+                app_sum_docs = in_app_single + in_app_godou + in_app_oh
+                rate_val = (app_sum_docs / total_send_docs * 100) if total_send_docs > 0 else 0
+                calc_final_profit = in_final_rev - (total_labor_cost + current_sys_cost)
 
-                    if st.button(f"💾 【{target_month_for_cost}】の承認後確定データを保存", key="btn_save_monthly_rev_t4"):
-                        try:
-                            save_monthly_revenue_records(spreadsheet_id, target_month_for_cost, input_records)
-                            st.success(f"{target_month_for_cost}の確定データをスプレッドシートに保存しました！")
-                            st.rerun()
-                        except Exception as rev_err:
-                            st.error(f"保存に失敗しました: {rev_err}")
-                else:
-                    st.info(f"【{target_month_for_cost}】の架電成果データが見つかりません。")
+                st.markdown(
+                    f"💡 **【判定サマリー】** 承認件数合計: **{app_sum_docs}件** / 送客数: **{total_send_docs}件** "
+                    f"（実効承認率: **{rate_val:.1f}%**） ｜ **確定粗利益: ¥{int(calc_final_profit):,}**"
+                )
+
+                if st.button(f"💾 【{target_month_for_cost}】の確定データを保存・更新する", key="btn_save_detailed_rev"):
+                    try:
+                        save_monthly_revenue_detailed(spreadsheet_id, target_month_for_cost, send_counts, est_total_revenue, in_app_single, in_app_godou, in_app_oh, in_final_rev)
+                        st.success(f"{target_month_for_cost}の確定データをスプレッドシートに保存しました！")
+                        st.rerun()
+                    except Exception as rev_err:
+                        st.error(f"保存に失敗しました: {rev_err}")
 
                 # --- D. 蓄積された月次収益記録の一覧テーブル ---
                 st.markdown("---")
                 st.subheader("📚 月次収益記録 一覧（過去蓄積データ）")
                 if not df_revenue_records.empty:
                     df_disp = df_revenue_records.copy()
-                    # 表示を見やすくフォーマット
-                    df_disp["自動算出売上"] = df_disp["自動算出売上"].apply(lambda x: f"¥{int(x):,}" if str(x).replace('-','').isdigit() else str(x))
-                    df_disp["承認後売上"] = df_disp["承認後売上"].apply(lambda x: f"¥{int(x):,}" if str(x).replace('-','').isdigit() else str(x))
-                    st.dataframe(df_disp, use_container_width=True)
+
+                    # 数値型に変換
+                    num_cols = ["送客_単独LP", "送客_合同LP3", "送客_合同LP4", "送客_不動産合同", "送客_TLデッド", "送客_合計", "想定売上", "承認_単独TL", "承認_合同", "承認_オープンハウス", "承認_合計", "確定売上"]
+                    for nc in num_cols:
+                        if nc in df_disp.columns:
+                            df_disp[nc] = pd.to_numeric(df_disp[nc], errors='coerce').fillna(0).astype(int)
+
+                    # 承認率計算
+                    df_disp["承認率(%)"] = (df_disp["承認_合計"] / df_disp["送客_合計"] * 100).fillna(0).round(1)
+
+                    # 表示用フォーマット整理
+                    df_disp["送客_単独LP"] = df_disp["送客_単独LP"].apply(lambda x: f"{x:,}件")
+                    df_disp["送客_合同LP3"] = df_disp["送客_合同LP3"].apply(lambda x: f"{x:,}件")
+                    df_disp["送客_合同LP4"] = df_disp["送客_合同LP4"].apply(lambda x: f"{x:,}件")
+                    df_disp["送客_不動産合同"] = df_disp["送客_不動産合同"].apply(lambda x: f"{x:,}件")
+                    df_disp["送客_TLデッド"] = df_disp["送客_TLデッド"].apply(lambda x: f"{x:,}件")
+                    df_disp["送客_合計"] = df_disp["送客_合計"].apply(lambda x: f"{x:,}件")
+                    df_disp["想定売上"] = df_disp["想定売上"].apply(lambda x: f"¥{x:,}")
+
+                    df_disp["承認_単独TL"] = df_disp["承認_単独TL"].apply(lambda x: f"{x:,}件")
+                    df_disp["承認_合同"] = df_disp["承認_合同"].apply(lambda x: f"{x:,}件")
+                    df_disp["承認_オープンハウス"] = df_disp["承認_オープンハウス"].apply(lambda x: f"{x:,}件")
+                    df_disp["承認_合計"] = df_disp["承認_合計"].apply(lambda x: f"{x:,}件")
+                    df_disp["確定売上"] = df_disp["確定売上"].apply(lambda x: f"¥{x:,}")
+                    df_disp["承認率"] = df_disp["承認率(%)"].apply(lambda x: f"{x:.1f}%")
+
+                    cols_order = [
+                        "年月",
+                        "送客_単独LP", "送客_合同LP3", "送客_合同LP4", "送客_不動産合同", "送客_TLデッド", "送客_合計",
+                        "想定売上",
+                        "承認_単独TL", "承認_合同", "承認_オープンハウス", "承認_合計",
+                        "確定売上",
+                        "承認率",
+                        "更新日時"
+                    ]
+                    
+                    st.dataframe(df_disp[[c for c in cols_order if c in df_disp.columns]], use_container_width=True)
                 else:
                     st.info("まだ保存された月次記録はありません。上記フォームから確定データを保存すると一覧に蓄積されます。")
 
